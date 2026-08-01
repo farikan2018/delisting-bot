@@ -23,6 +23,10 @@ TELEGRAM_BOT_TOKEN = _ENV.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = _ENV.get("TELEGRAM_CHAT_ID", "").strip()
 POLL_INTERVAL = float(_ENV.get("POLL_INTERVAL", "3") or "3")
 
+# Біржа виконання (MEXC). Ключі задаються на сервері у .env, у git не потрапляють.
+MEXC_API_KEY = _ENV.get("MEXC_API_KEY", "").strip()
+MEXC_API_SECRET = _ENV.get("MEXC_API_SECRET", "").strip()
+
 # Binance Announcements CMS API. catalogId=161 = розділ "Delisting".
 BINANCE_CMS_URL = (
     "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
