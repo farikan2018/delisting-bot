@@ -27,6 +27,12 @@ POLL_INTERVAL = float(_ENV.get("POLL_INTERVAL", "3") or "3")
 MEXC_API_KEY = _ENV.get("MEXC_API_KEY", "").strip()
 MEXC_API_SECRET = _ENV.get("MEXC_API_SECRET", "").strip()
 
+# --- Торгові параметри (Фаза 3) ---
+# DRY_RUN=1 → бот лише повідомляє «я б відкрив шорт», реальних ордерів НЕ ставить.
+DRY_RUN = (_ENV.get("DRY_RUN", "1").strip() != "0")
+POSITION_MARGIN_USDT = float(_ENV.get("POSITION_MARGIN_USDT", "15") or "15")
+LEVERAGE = float(_ENV.get("LEVERAGE", "3") or "3")
+
 # Binance Announcements CMS API. catalogId=161 = розділ "Delisting".
 BINANCE_CMS_URL = (
     "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"

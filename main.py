@@ -17,6 +17,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 import binance_watcher as bw
 import config
+import executor
 import storage
 import telegram_client as tg
 
@@ -62,6 +63,17 @@ async def _watch_loop() -> None:
                         continue
                     print(f"[{stamp}] НОВИЙ ДЕЛІСТИНГ: {ev.tickers} | {ev.title}")
                     await tg.send_message(_fmt_event(ev))
+
+                    # Тільки для повного делістингу токена — план шорта.
+                    if ev.actionable and ev.tickers:
+                        try:
+                            plan_text = await asyncio.to_thread(
+                                executor.handle_signal_dryrun, ev.tickers
+                            )
+                            await tg.send_message(plan_text)
+                            print(f"[{stamp}] {'DRY-RUN план' if config.DRY_RUN else 'ВИКОНАННЯ'}: {ev.tickers}")
+                        except Exception as e:  # noqa: BLE001
+                            print(f"[{stamp}] помилка executor: {e}")
                 if first_run:
                     print("[i] Первинні анонси позначені як бачені. Далі — тільки нові.")
                     first_run = False
@@ -72,9 +84,11 @@ async def _watch_loop() -> None:
 
 async def main() -> None:
     if config.TELEGRAM_CHAT_ID:
+        mode = "🧪 DRY-RUN (без реальних ордерів)" if config.DRY_RUN else "⚠️ РЕАЛЬНА ТОРГІВЛЯ"
         await tg.send_message(
-            "🟢 <b>Delisting-бот запущено</b> (Фаза 1: сповіщення).\n"
-            f"Poll кожні {config.POLL_INTERVAL:g}с."
+            "🟢 <b>Delisting-бот запущено</b>\n"
+            f"Режим: {mode}\n"
+            f"Маржа ${config.POSITION_MARGIN_USDT:g} × {config.LEVERAGE:g}x | poll {config.POLL_INTERVAL:g}с."
         )
     else:
         print("[!] TELEGRAM_CHAT_ID не заданий — сповіщення підуть у консоль. "
