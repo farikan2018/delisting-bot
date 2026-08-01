@@ -1,69 +1,176 @@
-"""Executor — рішення й дії по сигналу делістингу.
+"""Executor — відкриття, моніторинг і закриття шортів по сигналу делістингу.
 
-Фаза 3a: тільки DRY-RUN. Для кожного тикера події:
-  - шукає перп на MEXC,
-  - рахує, який шорт відкрив би (розмір/плече/контракти),
-  - формує людський опис плану.
-Реальних ордерів НЕ ставить, поки config.DRY_RUN=True.
+DRY_RUN=True: усе симулюється (реальні ціни, віртуальні угоди), ордери не ставляться.
+DRY_RUN=False: реальні ринкові ордери на MEXC (ізольована маржа).
 """
-from dataclasses import dataclass
+import asyncio
+import datetime as dt
 
 import config
 import exchange
+import storage
+import strategy
+import telegram_client as tg
+
+_MODE = "dry" if config.DRY_RUN else "real"
+
+_REASON_LABEL = {
+    "STOP_LOSS": "🛑 Стоп-лос",
+    "TRAILING_TP": "📉 Тейк-профіт (трейлінг)",
+    "MAX_HOLD": "⏰ Ліміт часу",
+    "MANUAL": "🔧 Ручне закриття",
+}
 
 
-@dataclass
-class Plan:
-    ticker: str
-    symbol: str | None
-    price: float | None
-    contracts: float | None
-    notional: float | None
-    note: str
+# ---------- ВІДКРИТТЯ ----------
+async def open_from_signal(ticker: str) -> None:
+    """Обробляє один тикер делістингу: перевірки → вхід → повідомлення."""
+    symbol = await asyncio.to_thread(exchange.resolve_short_symbol, ticker)
+    if not symbol:
+        await tg.send_message(f"ℹ️ <b>{ticker}</b>: нема перпа на MEXC — пропуск.")
+        return
 
+    if storage.has_open_position(symbol):
+        await tg.send_message(f"ℹ️ <b>{ticker}</b>: позиція вже відкрита — пропуск.")
+        return
+    if storage.open_positions_count() >= config.MAX_CONCURRENT:
+        await tg.send_message(
+            f"⚠️ <b>{ticker}</b>: досягнуто ліміту одночасних позицій "
+            f"({config.MAX_CONCURRENT}) — пропуск."
+        )
+        return
 
-def build_plans(tickers: list[str]) -> list[Plan]:
-    plans = []
-    for ticker in tickers:
+    decision = await asyncio.to_thread(strategy.evaluate_entry, symbol)
+    if not decision.ok:
+        await tg.send_message(
+            f"⏭️ <b>{ticker}</b> ({symbol}): не входимо — {decision.reason}."
+        )
+        return
+
+    entry_price = decision.entry_price
+    notional = config.POSITION_MARGIN_USDT * config.LEVERAGE
+    contracts = await asyncio.to_thread(
+        exchange.contracts_for, symbol, notional, entry_price
+    )
+    contract_size = (await asyncio.to_thread(exchange.market_meta, symbol))["contract_size"]
+
+    # Реальне відкриття (тільки не в dry-run)
+    if not config.DRY_RUN:
         try:
-            symbol = exchange.resolve_short_symbol(ticker)
-        except Exception as e:  # noqa: BLE001
-            plans.append(Plan(ticker, None, None, None, None, f"помилка пошуку: {e}"))
-            continue
-
-        if not symbol:
-            plans.append(Plan(ticker, None, None, None, None, "нема перпа на MEXC — пропуск"))
-            continue
-
-        try:
-            price = exchange.get_last_price(symbol)
-            meta = exchange.market_meta(symbol)
-            notional = config.POSITION_MARGIN_USDT * config.LEVERAGE
-            contracts = None
-            if price and meta["contract_size"]:
-                contracts = notional / (price * meta["contract_size"])
-            plans.append(Plan(ticker, symbol, price, contracts, notional, "OK"))
-        except Exception as e:  # noqa: BLE001
-            plans.append(Plan(ticker, symbol, None, None, None, f"помилка ціни/ринку: {e}"))
-    return plans
-
-
-def format_plans(plans: list[Plan]) -> str:
-    lines = ["🧪 <b>DRY-RUN — план дій</b> (реальних ордерів нема)"]
-    for p in plans:
-        if p.symbol and p.note == "OK":
-            c = f"{p.contracts:.4f}" if p.contracts is not None else "?"
-            lines.append(
-                f"• <b>{p.ticker}</b> → шорт <code>{p.symbol}</code>\n"
-                f"   маржа ${config.POSITION_MARGIN_USDT:g} × {config.LEVERAGE:g}x = "
-                f"${p.notional:g} notional (~{c} контр.) @ ~{p.price}"
+            order = await asyncio.to_thread(
+                exchange.open_short, symbol, contracts, config.LEVERAGE
             )
-        else:
-            lines.append(f"• <b>{p.ticker}</b> — {p.note}")
-    return "\n".join(lines)
+            entry_price = order.get("average") or order.get("price") or entry_price
+        except Exception as e:  # noqa: BLE001
+            await tg.send_message(f"❌ <b>{ticker}</b>: помилка відкриття ордера: {e}")
+            return
+
+    pos = {
+        "ticker": ticker, "symbol": symbol, "mode": _MODE,
+        "margin": config.POSITION_MARGIN_USDT, "leverage": config.LEVERAGE,
+        "contracts": contracts, "contract_size": contract_size,
+        "ref_price": decision.ref_price, "entry_price": entry_price,
+        "dropped_pct": decision.dropped_pct,
+    }
+    pos_id = storage.insert_position(pos)
+    await tg.send_message(_open_message(pos_id, pos))
 
 
-def handle_signal_dryrun(tickers: list[str]) -> str:
-    """Повертає готовий текст для Telegram по події делістингу (dry-run)."""
-    plans = build_plans(tickers)
-    return format_plans(plans)
+def _open_message(pos_id: int, p: dict) -> str:
+    tag = "🧪 DRY-RUN" if config.DRY_RUN else "⚠️ РЕАЛ"
+    sl_price = p["entry_price"] * (1 + config.STOP_LOSS_PCT / 100)
+    notional = p["margin"] * p["leverage"]
+    return (
+        f"🟢 <b>ВІДКРИТО ШОРТ</b> [{tag}] #{pos_id}\n"
+        f"Монета: <b>{p['ticker']}</b> (<code>{p['symbol']}</code>)\n"
+        f"Ціна входу: <b>{_fmt(p['entry_price'])}</b>\n"
+        f"Вже впало: <b>{p['dropped_pct']:.1f}%</b> (від макс за {config.REF_LOOKBACK_MIN} хв)\n"
+        f"Розмір: ${p['margin']:g} × {p['leverage']:g}x = ${notional:g} "
+        f"(~{p['contracts']:g} контр.)\n"
+        f"🛑 Стоп-лос: {_fmt(sl_price)} (+{config.STOP_LOSS_PCT:g}%) | "
+        f"📉 трейлінг {config.TRAIL_PCT:g}%"
+    )
+
+
+# ---------- МОНІТОРИНГ / ЗАКРИТТЯ ----------
+async def monitor_once() -> None:
+    """Один прохід по всіх відкритих позиціях: оновити мінімум, перевірити вихід."""
+    positions = storage.get_open_positions()
+    for pos in positions:
+        try:
+            price = await asyncio.to_thread(exchange.get_last_price, pos["symbol"])
+            if not price:
+                continue
+            if price < pos["min_price"]:
+                storage.update_min_price(pos["id"], price)
+                pos["min_price"] = price
+            should_close, reason = strategy.check_exit(pos, price)
+            if should_close:
+                await _do_close(pos, price, reason)
+        except Exception as e:  # noqa: BLE001
+            print(f"[monitor] помилка по {pos.get('symbol')}: {e}")
+
+
+async def force_close(pos_id: int, reason: str = "MANUAL") -> bool:
+    """Ручне закриття позиції за id (для тестів/команд Telegram)."""
+    for pos in storage.get_open_positions():
+        if pos["id"] == pos_id:
+            price = await asyncio.to_thread(exchange.get_last_price, pos["symbol"])
+            await _do_close(pos, price, reason)
+            return True
+    return False
+
+
+async def _do_close(pos: dict, price: float, reason: str) -> None:
+    exit_price = price
+    if not config.DRY_RUN:
+        try:
+            order = await asyncio.to_thread(
+                exchange.close_short, pos["symbol"], pos["contracts"]
+            )
+            exit_price = order.get("average") or order.get("price") or price
+        except Exception as e:  # noqa: BLE001
+            await tg.send_message(
+                f"❌ <b>{pos['ticker']}</b>: помилка закриття (#{pos['id']}): {e}\n"
+                f"⚠️ Перевір позицію вручну на MEXC!"
+            )
+            return
+
+    pnl_usdt = pos["contracts"] * pos["contract_size"] * (pos["entry_price"] - exit_price)
+    pnl_pct = (pos["entry_price"] - exit_price) / pos["entry_price"] * 100 * pos["leverage"]
+    storage.close_position(pos["id"], exit_price, reason, pnl_usdt, pnl_pct)
+    await tg.send_message(_close_message(pos, exit_price, reason, pnl_usdt, pnl_pct))
+
+
+def _close_message(p: dict, exit_price: float, reason: str,
+                   pnl_usdt: float, pnl_pct: float) -> str:
+    tag = "🧪 DRY-RUN" if config.DRY_RUN else "⚠️ РЕАЛ"
+    emoji = "✅" if pnl_usdt >= 0 else "🔻"
+    dur = _duration(p.get("opened_at"))
+    return (
+        f"{emoji} <b>ЗАКРИТО ШОРТ</b> [{tag}] #{p['id']}\n"
+        f"Монета: <b>{p['ticker']}</b> (<code>{p['symbol']}</code>)\n"
+        f"Причина: <b>{_REASON_LABEL.get(reason, reason)}</b>\n"
+        f"Вхід: {_fmt(p['entry_price'])} → Вихід: {_fmt(exit_price)}\n"
+        f"Прибуток: <b>{pnl_usdt:+.2f} USDT</b> ({pnl_pct:+.1f}% від маржі)\n"
+        f"Тривалість: {dur}"
+    )
+
+
+# ---------- утиліти ----------
+def _fmt(x: float) -> str:
+    if x is None:
+        return "?"
+    if x >= 1:
+        return f"{x:.4f}".rstrip("0").rstrip(".")
+    return f"{x:.8f}".rstrip("0").rstrip(".")
+
+
+def _duration(opened_at: str | None) -> str:
+    o = strategy._parse_ts(opened_at) if opened_at else None
+    if not o:
+        return "?"
+    secs = int((dt.datetime.utcnow() - o).total_seconds())
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}г {m}хв" if h else f"{m}хв {s}с"

@@ -1,6 +1,8 @@
-"""Фаза 1: стежимо за делістингами Binance і шлемо сповіщення в Telegram.
+"""Delisting-бот: watcher делістингів Binance + executor шортів на MEXC.
 
-Реальних ордерів НЕМАЄ. Це безпечний режим для перевірки якості й швидкості сигналів.
+Два паралельні цикли: _watch_loop (ловить делістинги, відкриває шорти)
+і _monitor_loop (стежить за позиціями, закриває за стратегією).
+Режим торгівлі керується config.DRY_RUN (симуляція vs реальні ордери).
 """
 import asyncio
 import datetime as dt
@@ -64,16 +66,13 @@ async def _watch_loop() -> None:
                     print(f"[{stamp}] НОВИЙ ДЕЛІСТИНГ: {ev.tickers} | {ev.title}")
                     await tg.send_message(_fmt_event(ev))
 
-                    # Тільки для повного делістингу токена — план шорта.
+                    # Тільки для повного делістингу токена — відкриваємо шорт(и).
                     if ev.actionable and ev.tickers:
-                        try:
-                            plan_text = await asyncio.to_thread(
-                                executor.handle_signal_dryrun, ev.tickers
-                            )
-                            await tg.send_message(plan_text)
-                            print(f"[{stamp}] {'DRY-RUN план' if config.DRY_RUN else 'ВИКОНАННЯ'}: {ev.tickers}")
-                        except Exception as e:  # noqa: BLE001
-                            print(f"[{stamp}] помилка executor: {e}")
+                        for ticker in ev.tickers:
+                            try:
+                                await executor.open_from_signal(ticker)
+                            except Exception as e:  # noqa: BLE001
+                                print(f"[{stamp}] помилка executor {ticker}: {e}")
                 if first_run:
                     print("[i] Первинні анонси позначені як бачені. Далі — тільки нові.")
                     first_run = False
@@ -82,18 +81,32 @@ async def _watch_loop() -> None:
             await asyncio.sleep(config.POLL_INTERVAL)
 
 
+async def _monitor_loop() -> None:
+    """Паралельний цикл: стежить за відкритими позиціями й закриває за стратегією."""
+    while True:
+        try:
+            await executor.monitor_once()
+        except Exception as e:  # noqa: BLE001
+            print(f"[{dt.datetime.now():%H:%M:%S}] помилка monitor: {e}")
+        await asyncio.sleep(config.EXIT_CHECK_SEC)
+
+
 async def main() -> None:
+    storage.init()
     if config.TELEGRAM_CHAT_ID:
         mode = "🧪 DRY-RUN (без реальних ордерів)" if config.DRY_RUN else "⚠️ РЕАЛЬНА ТОРГІВЛЯ"
+        open_n = storage.open_positions_count()
         await tg.send_message(
             "🟢 <b>Delisting-бот запущено</b>\n"
             f"Режим: {mode}\n"
-            f"Маржа ${config.POSITION_MARGIN_USDT:g} × {config.LEVERAGE:g}x | poll {config.POLL_INTERVAL:g}с."
+            f"Маржа ${config.POSITION_MARGIN_USDT:g} × {config.LEVERAGE:g}x | poll {config.POLL_INTERVAL:g}с\n"
+            f"Відкритих позицій: {open_n}"
         )
     else:
         print("[!] TELEGRAM_CHAT_ID не заданий — сповіщення підуть у консоль. "
               "Запусти get_chat_id.py, щоб його дізнатися.")
-    await _watch_loop()
+    # watcher і monitor працюють паралельно
+    await asyncio.gather(_watch_loop(), _monitor_loop())
 
 
 if __name__ == "__main__":
