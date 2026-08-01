@@ -68,11 +68,54 @@ def main() -> None:
     except ccxt.AuthenticationError as e:
         print(f"   ❌ AuthenticationError: {e}")
         print("   => неправильний ключ/секрет, або немає прав на ф'ючерси, або потрібна прив'язка IP.")
+        return
     except ccxt.PermissionDenied as e:
         print(f"   ❌ PermissionDenied: {e}")
         print("   => ключу бракує потрібних прав (перевір галочки ф'ючерсів).")
+        return
     except Exception as e:  # noqa: BLE001
         print(f"   ❌ {type(e).__name__}: {e}")
+        return
+
+    # 4) Проба розміщення ордера — ТІЛЬКИ з прапорцем --place
+    if "--place" not in sys.argv:
+        print("\n(Проба ордера пропущена. Щоб перевірити розміщення — запусти з --place)")
+        return
+    probe_order(ex, t)
+
+
+def probe_order(ex, ticker) -> None:
+    """Безпечна проба: лімітний buy на 40% нижче ринку (не виконається) + скасування."""
+    print("\n== 4) ПРОБА РОЗМІЩЕННЯ ОРДЕРА (buy -40% від ринку, потім скасування) ==")
+    market = ex.market(SAMPLE)
+    last = ticker.get("last")
+    price = float(ex.price_to_precision(SAMPLE, last * 0.6))  # 40% нижче — не заповниться
+    min_amt = (market.get("limits", {}).get("amount", {}) or {}).get("min") or 1
+    amount = float(ex.amount_to_precision(SAMPLE, min_amt))
+    print(f"   символ={SAMPLE} side=buy amount={amount} price={price} (ринок={last})")
+
+    order = None
+    try:
+        # isolated margin, мінімальне плече — щоб маржа була мінімальна
+        params = {"marginMode": "isolated", "leverage": 1}
+        order = ex.create_order(SAMPLE, "limit", "buy", amount, price, params)
+        oid = order.get("id")
+        print(f"   ✅✅ ОРДЕР ПРИЙНЯТО! id={oid}")
+        print("   => 🟢 API-ТОРГІВЛЯ ПРАЦЮЄ. Головний ризик знято.")
+    except ccxt.NotSupported as e:
+        print(f"   🔴 NotSupported: {e}")
+        print("   => ccxt каже, що MEXC не підтримує розміщення контрактних ордерів через API.")
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️ {type(e).__name__}: {e}")
+        print("   => дивимось на текст: якщо про 'interface/contract not open' — API-торгівля закрита;")
+        print("      якщо про параметр (leverage/openType/precision) — підправимо виклик і повторимо.")
+    finally:
+        if order and order.get("id"):
+            try:
+                ex.cancel_order(order["id"], SAMPLE)
+                print("   🧹 тест-ордер скасовано.")
+            except Exception as e:  # noqa: BLE001
+                print(f"   ⚠️ не вдалось скасувати автоматично ({e}) — перевір вручну на MEXC!")
 
 
 if __name__ == "__main__":
