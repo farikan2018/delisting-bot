@@ -20,8 +20,27 @@ if [ ! -f .env ]; then
   exit 1
 fi
 
-echo "==> Встановлення systemd-сервісу (автозапуск 24/7)..."
-sudo cp deploy/delisting-bot.service /etc/systemd/system/delisting-bot.service
+echo "==> Генерація systemd-сервісу під поточного користувача ($USER)..."
+# Не використовуємо статичний файл із хардкодом 'ubuntu' — на GCP користувач інший.
+sudo tee /etc/systemd/system/delisting-bot.service >/dev/null <<EOF
+[Unit]
+Description=Delisting Short Bot (Phase 1: notifications)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$APP_DIR
+Environment=PYTHONUTF8=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=$APP_DIR/.venv/bin/python $APP_DIR/main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
 sudo systemctl daemon-reload
 sudo systemctl enable delisting-bot
 sudo systemctl restart delisting-bot

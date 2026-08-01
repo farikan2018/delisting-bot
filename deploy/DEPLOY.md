@@ -1,3 +1,30 @@
+# === Google Cloud (Ubuntu 22.04) — через браузерний SSH + GitHub ===
+#
+# Відкрий SSH до інстансу (кнопка SSH у Compute Engine → VM instances)
+# і встав ЦЕЙ блок повністю:
+#
+# ```bash
+# sudo apt-get update -y && sudo apt-get install -y git python3 python3-venv python3-pip
+# git clone https://github.com/farikan2018/delisting-bot.git ~/delisting-bot
+# cd ~/delisting-bot
+# cat > .env <<'EOF'
+# TELEGRAM_BOT_TOKEN=8694704608:AAEk7EXoMx5RwUaf_ScZRHW0rUK0Tv1f8k4
+# TELEGRAM_CHAT_ID=641324432
+# POLL_INTERVAL=3
+# EOF
+# bash deploy/setup.sh
+# ```
+#
+# setup.sh поставить venv, залежності і автозапуск через systemd.
+# Перевірка логів:  journalctl -u delisting-bot -f
+#
+# Оновлення коду згодом:
+# ```bash
+# cd ~/delisting-bot && git pull && sudo systemctl restart delisting-bot
+# ```
+#
+# ---------------------------------------------------------------------
+
 # Розгортання на Oracle Cloud (Ubuntu 22.04, ARM)
 
 ## Передумови
