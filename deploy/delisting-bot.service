@@ -1,0 +1,17 @@
+[Unit]
+Description=Delisting Short Bot (Phase 1: notifications)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/delisting-bot
+Environment=PYTHONUTF8=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/delisting-bot/.venv/bin/python /home/ubuntu/delisting-bot/main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
