@@ -35,18 +35,19 @@ BYBIT_API_SECRET = _ENV.get("BYBIT_API_SECRET", "").strip()
 # DRY_RUN=1 → бот лише симулює угоди (реальних ордерів НЕ ставить).
 DRY_RUN = (_ENV.get("DRY_RUN", "1").strip() != "0")
 POSITION_MARGIN_USDT = float(_ENV.get("POSITION_MARGIN_USDT", "100") or "100")
-LEVERAGE = float(_ENV.get("LEVERAGE", "7") or "7")
+LEVERAGE = float(_ENV.get("LEVERAGE", "3") or "3")
 
-# --- Вхід: anti-late-entry ---
-# Якщо за останні REF_LOOKBACK_MIN хв ціна вже впала більше ніж на MAX_ALREADY_DROP_PCT — не входимо.
+# --- Вхід (Strategy v2) ---
+# Головний дамп стається В МОМЕНТ анонсу (до появи в API), тому backward-фільтр «вже впало»
+# ріже все. Ловимо CONTINUATION: входимо на детекті. REF_LOOKBACK_MIN лишаємо тільки для
+# інформації в повідомленні (на скільки вже впало). MAX_ALREADY_DROP_PCT=0 → фільтр вимкнено.
 REF_LOOKBACK_MIN = int(_ENV.get("REF_LOOKBACK_MIN", "5") or "5")
-MAX_ALREADY_DROP_PCT = float(_ENV.get("MAX_ALREADY_DROP_PCT", "10") or "10")
+MAX_ALREADY_DROP_PCT = float(_ENV.get("MAX_ALREADY_DROP_PCT", "0") or "0")  # 0 = не відсіювати
 
-# --- Вихід (усе у % від МАРЖІ — інтуїтивно в грошах) ---
-STOP_LOSS_MARGIN_PCT = float(_ENV.get("STOP_LOSS_MARGIN_PCT", "25") or "25")        # збиток -25% маржі → стоп
-TRAIL_ARM_MARGIN_PCT = float(_ENV.get("TRAIL_ARM_MARGIN_PCT", "30") or "30")        # трейл вмикається після +30% маржі
-TRAIL_GIVEBACK_MARGIN_PCT = float(_ENV.get("TRAIL_GIVEBACK_MARGIN_PCT", "15") or "15")  # віддали 15% маржі від піку → вихід
-MAX_HOLD_MINUTES = float(_ENV.get("MAX_HOLD_MINUTES", "30") or "30")                # примусове закриття
+# --- Вихід (усе у % від МАРЖІ) ---
+STOP_LOSS_MARGIN_PCT = float(_ENV.get("STOP_LOSS_MARGIN_PCT", "30") or "30")        # збиток -30% маржі → стоп
+TAKE_PROFIT_MARGIN_PCT = float(_ENV.get("TAKE_PROFIT_MARGIN_PCT", "30") or "30")    # прибуток +30% маржі → тейк
+MAX_HOLD_MINUTES = float(_ENV.get("MAX_HOLD_MINUTES", "45") or "45")                # примусове закриття
 EXIT_CHECK_SEC = float(_ENV.get("EXIT_CHECK_SEC", "5") or "5")                      # частота перевірки позицій
 
 # Risk-ліміти
