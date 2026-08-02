@@ -18,11 +18,11 @@ class EntryDecision:
     dropped_pct: float | None  # на скільки вже впала від ref до входу
 
 
-def evaluate_entry(symbol: str) -> EntryDecision:
+def evaluate_entry(venue: str, symbol: str) -> EntryDecision:
     """Рахує «до-дампову» ціну (макс за REF_LOOKBACK_MIN хв) і поточну,
     визначає, чи не пізно входити."""
-    ref_price = exchange.reference_high(symbol, config.REF_LOOKBACK_MIN)
-    entry_price = exchange.get_last_price(symbol)
+    ref_price = exchange.reference_high(venue, symbol, config.REF_LOOKBACK_MIN)
+    entry_price = exchange.get_last_price(venue, symbol)
 
     if not ref_price or not entry_price:
         return EntryDecision(False, "нема даних ціни", ref_price, entry_price, None)

@@ -34,7 +34,7 @@ async def main() -> None:
         if not rows:
             print("Відкритих позицій немає.")
         for p in rows:
-            print(f"#{p['id']} {p['ticker']} {p['symbol']} mode={p['mode']} "
+            print(f"#{p['id']} {p['ticker']} {p['symbol']} @{p.get('venue')} mode={p['mode']} "
                   f"entry={p['entry_price']} min={p['min_price']} "
                   f"dropped={p['dropped_pct']}")
 

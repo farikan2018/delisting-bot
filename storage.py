@@ -23,6 +23,7 @@ def init() -> None:
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 ticker        TEXT,
                 symbol        TEXT,
+                venue         TEXT,     -- біржа виконання (bybit/mexc)
                 mode          TEXT,     -- dry / real
                 margin        REAL,
                 leverage      REAL,
@@ -41,6 +42,10 @@ def init() -> None:
                 closed_at     TEXT
             )"""
         )
+        # міграція: додати venue, якщо БД створювалась до мульти-біржі
+        cols = [r[1] for r in db.execute("PRAGMA table_info(positions)").fetchall()]
+        if "venue" not in cols:
+            db.execute("ALTER TABLE positions ADD COLUMN venue TEXT")
         db.commit()
 
 
@@ -85,11 +90,11 @@ def insert_position(p: dict) -> int:
     with _conn() as db:
         cur = db.execute(
             """INSERT INTO positions
-               (ticker, symbol, mode, margin, leverage, contracts, contract_size,
+               (ticker, symbol, venue, mode, margin, leverage, contracts, contract_size,
                 ref_price, entry_price, dropped_pct, min_price, status)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,'open')""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open')""",
             (
-                p["ticker"], p["symbol"], p["mode"], p["margin"], p["leverage"],
+                p["ticker"], p["symbol"], p["venue"], p["mode"], p["margin"], p["leverage"],
                 p["contracts"], p["contract_size"], p["ref_price"], p["entry_price"],
                 p["dropped_pct"], p["entry_price"],
             ),

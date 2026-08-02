@@ -25,9 +25,10 @@ _REASON_LABEL = {
 # ---------- ВІДКРИТТЯ ----------
 async def open_from_signal(ticker: str) -> None:
     """Обробляє один тикер делістингу: перевірки → вхід → повідомлення."""
-    symbol = await asyncio.to_thread(exchange.resolve_short_symbol, ticker)
+    venue, symbol = await asyncio.to_thread(exchange.resolve, ticker)
     if not symbol:
-        await tg.send_message(f"ℹ️ <b>{ticker}</b>: нема перпа на MEXC — пропуск.")
+        vs = "/".join(config.VENUE_PRIORITY)
+        await tg.send_message(f"ℹ️ <b>{ticker}</b>: нема перпа на {vs} — пропуск.")
         return
 
     if storage.has_open_position(symbol):
@@ -40,33 +41,33 @@ async def open_from_signal(ticker: str) -> None:
         )
         return
 
-    decision = await asyncio.to_thread(strategy.evaluate_entry, symbol)
+    decision = await asyncio.to_thread(strategy.evaluate_entry, venue, symbol)
     if not decision.ok:
         await tg.send_message(
-            f"⏭️ <b>{ticker}</b> ({symbol}): не входимо — {decision.reason}."
+            f"⏭️ <b>{ticker}</b> ({venue}): не входимо — {decision.reason}."
         )
         return
 
     entry_price = decision.entry_price
     notional = config.POSITION_MARGIN_USDT * config.LEVERAGE
     contracts = await asyncio.to_thread(
-        exchange.contracts_for, symbol, notional, entry_price
+        exchange.contracts_for, venue, symbol, notional, entry_price
     )
-    contract_size = (await asyncio.to_thread(exchange.market_meta, symbol))["contract_size"]
+    contract_size = (await asyncio.to_thread(exchange.market_meta, venue, symbol))["contract_size"]
 
     # Реальне відкриття (тільки не в dry-run)
     if not config.DRY_RUN:
         try:
             order = await asyncio.to_thread(
-                exchange.open_short, symbol, contracts, config.LEVERAGE
+                exchange.open_short, venue, symbol, contracts, config.LEVERAGE
             )
             entry_price = order.get("average") or order.get("price") or entry_price
         except Exception as e:  # noqa: BLE001
-            await tg.send_message(f"❌ <b>{ticker}</b>: помилка відкриття ордера: {e}")
+            await tg.send_message(f"❌ <b>{ticker}</b>: помилка відкриття ордера ({venue}): {e}")
             return
 
     pos = {
-        "ticker": ticker, "symbol": symbol, "mode": _MODE,
+        "ticker": ticker, "symbol": symbol, "venue": venue, "mode": _MODE,
         "margin": config.POSITION_MARGIN_USDT, "leverage": config.LEVERAGE,
         "contracts": contracts, "contract_size": contract_size,
         "ref_price": decision.ref_price, "entry_price": entry_price,
@@ -84,7 +85,7 @@ def _open_message(pos_id: int, p: dict) -> str:
     sl_loss = p["margin"] * config.STOP_LOSS_MARGIN_PCT / 100
     return (
         f"🟢 <b>ВІДКРИТО ШОРТ</b> [{tag}] #{pos_id}\n"
-        f"Монета: <b>{p['ticker']}</b> (<code>{p['symbol']}</code>)\n"
+        f"Монета: <b>{p['ticker']}</b> (<code>{p['symbol']}</code>) на <b>{p.get('venue','?')}</b>\n"
         f"Ціна входу: <b>{_fmt(p['entry_price'])}</b>\n"
         f"Вже впало: <b>{p['dropped_pct']:.1f}%</b> (за {config.REF_LOOKBACK_MIN} хв)\n"
         f"Розмір: ${p['margin']:g} × {p['leverage']:g}x = ${notional:g} "
@@ -101,7 +102,7 @@ async def monitor_once() -> None:
     positions = storage.get_open_positions()
     for pos in positions:
         try:
-            price = await asyncio.to_thread(exchange.get_last_price, pos["symbol"])
+            price = await asyncio.to_thread(exchange.get_last_price, pos["venue"], pos["symbol"])
             if not price:
                 continue
             if price < pos["min_price"]:
@@ -118,7 +119,7 @@ async def force_close(pos_id: int, reason: str = "MANUAL") -> bool:
     """Ручне закриття позиції за id (для тестів/команд Telegram)."""
     for pos in storage.get_open_positions():
         if pos["id"] == pos_id:
-            price = await asyncio.to_thread(exchange.get_last_price, pos["symbol"])
+            price = await asyncio.to_thread(exchange.get_last_price, pos["venue"], pos["symbol"])
             await _do_close(pos, price, reason)
             return True
     return False
@@ -129,7 +130,7 @@ async def _do_close(pos: dict, price: float, reason: str) -> None:
     if not config.DRY_RUN:
         try:
             order = await asyncio.to_thread(
-                exchange.close_short, pos["symbol"], pos["contracts"]
+                exchange.close_short, pos["venue"], pos["symbol"], pos["contracts"]
             )
             exit_price = order.get("average") or order.get("price") or price
         except Exception as e:  # noqa: BLE001

@@ -99,6 +99,7 @@ async def main() -> None:
         await tg.send_message(
             "🟢 <b>Delisting-бот запущено</b>\n"
             f"Режим: {mode}\n"
+            f"Біржі: {' → '.join(config.VENUE_PRIORITY)}\n"
             f"Маржа ${config.POSITION_MARGIN_USDT:g} × {config.LEVERAGE:g}x | poll {config.POLL_INTERVAL:g}с\n"
             f"Відкритих позицій: {open_n}"
         )

@@ -1,105 +1,95 @@
-"""Обгортка над біржею виконання (MEXC через ccxt).
+"""Мульти-біржовий шар виконання (ccxt).
 
-Абстрактно й тонко — щоб за потреби замінити біржу в одному місці.
-У Фазі 3a використовуються лише публічні/read методи (resolve + ціна).
+Пріоритет бірж — config.VENUE_PRIORITY (за замовч. bybit → mexc).
+resolve() шукає перший майданчик, де токен має активний перп.
+Публічні методи (ціна, історія, наявність) працюють без ключів — тому dry-run
+не потребує API-ключів жодної біржі.
 """
 import ccxt
 
 import config
 
-_client = None
+_clients: dict[str, "ccxt.Exchange"] = {}
+
+_KEYS = {
+    "mexc": lambda: (config.MEXC_API_KEY, config.MEXC_API_SECRET),
+    "bybit": lambda: (config.BYBIT_API_KEY, config.BYBIT_API_SECRET),
+}
 
 
-def client() -> "ccxt.mexc":
-    global _client
-    if _client is None:
-        c = ccxt.mexc(
+def client(venue: str) -> "ccxt.Exchange":
+    if venue not in _clients:
+        key, sec = _KEYS.get(venue, lambda: ("", ""))()
+        c = getattr(ccxt, venue)(
             {
-                "apiKey": config.MEXC_API_KEY,
-                "secret": config.MEXC_API_SECRET,
+                "apiKey": key,
+                "secret": sec,
                 "enableRateLimit": True,
-                "options": {"defaultType": "swap"},  # ф'ючерси
+                "options": {"defaultType": "swap"},
             }
         )
         c.load_markets()
-        _client = c
-    return _client
+        _clients[venue] = c
+    return _clients[venue]
 
 
-def resolve_short_symbol(ticker: str) -> str | None:
-    """Знайти активний USDT-перп для базового тикера.
-
-    Повертає ccxt-символ (напр. 'ALPHA/USDT:USDT') або None, якщо перпа нема
-    чи він не торгується.
-    """
-    ex = client()
+def resolve(ticker: str) -> tuple[str | None, str | None]:
+    """(venue, symbol) для першої біржі з активним USDT-перпом, або (None, None)."""
     ticker = ticker.upper()
-    candidate = f"{ticker}/USDT:USDT"
-    m = ex.markets.get(candidate)
-    if m and m.get("swap") and m.get("active", True):
-        return candidate
-    return None
+    symbol = f"{ticker}/USDT:USDT"
+    for v in config.VENUE_PRIORITY:
+        try:
+            c = client(v)
+        except Exception:  # noqa: BLE001
+            continue
+        m = c.markets.get(symbol)
+        if m and m.get("swap") and m.get("active", True):
+            return v, symbol
+    return None, None
 
 
-def get_last_price(symbol: str) -> float | None:
-    return client().fetch_ticker(symbol).get("last")
+def get_last_price(venue: str, symbol: str) -> float | None:
+    return client(venue).fetch_ticker(symbol).get("last")
 
 
-def market_meta(symbol: str) -> dict:
-    """Дані ринку: contractSize, мін. розмір — для розрахунку кількості контрактів."""
-    m = client().market(symbol)
+def reference_high(venue: str, symbol: str, lookback_min: int) -> float | None:
+    """«До-дампова» ціна = максимум high за останні lookback_min хв (1m свічки)."""
+    try:
+        ohlcv = client(venue).fetch_ohlcv(symbol, "1m", limit=max(lookback_min, 1))
+        return max(c[2] for c in ohlcv) if ohlcv else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def market_meta(venue: str, symbol: str) -> dict:
+    m = client(venue).market(symbol)
     return {
         "contract_size": m.get("contractSize") or 1,
         "min_amount": (m.get("limits", {}).get("amount", {}) or {}).get("min"),
     }
 
 
-def reference_high(symbol: str, lookback_min: int) -> float | None:
-    """«До-дампова» ціна = максимум high за останні lookback_min хвилин (1m свічки)."""
-    try:
-        ohlcv = client().fetch_ohlcv(symbol, "1m", limit=max(lookback_min, 1))
-        if not ohlcv:
-            return None
-        return max(c[2] for c in ohlcv)  # index 2 = high
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def contracts_for(symbol: str, notional_usdt: float, price: float) -> float:
-    """Скільки контрактів дає задану notional-вартість за поточною ціною."""
-    cs = market_meta(symbol)["contract_size"] or 1
+def contracts_for(venue: str, symbol: str, notional_usdt: float, price: float) -> float:
+    cs = market_meta(venue, symbol)["contract_size"] or 1
     raw = notional_usdt / (price * cs)
-    ex = client()
     try:
-        return float(ex.amount_to_precision(symbol, raw))
+        return float(client(venue).amount_to_precision(symbol, raw))
     except Exception:  # noqa: BLE001
         return raw
 
 
-# ---- РЕАЛЬНІ торгові методи (використовуються лише коли DRY_RUN=False) ----
-def open_short(symbol: str, contracts: float, leverage: float) -> dict:
-    """Ринковий шорт з ізольованою маржею. Повертає інфо про ордер."""
-    ex = client()
-    # плече + ізольована маржа (MEXC: openType=1 isolated)
+# ---- РЕАЛЬНІ торгові методи (лише коли DRY_RUN=False) ----
+def open_short(venue: str, symbol: str, contracts: float, leverage: float) -> dict:
+    c = client(venue)
     try:
-        ex.set_leverage(int(leverage), symbol, {"openType": 1})
+        c.set_leverage(int(leverage), symbol)
     except Exception:  # noqa: BLE001
-        pass  # інколи плече задається у самому ордері
-    params = {"marginMode": "isolated", "openType": 1, "leverage": int(leverage)}
-    return ex.create_order(symbol, "market", "sell", contracts, None, params)
+        pass
+    params = {"marginMode": "isolated"}
+    return c.create_order(symbol, "market", "sell", contracts, None, params)
 
 
-def close_short(symbol: str, contracts: float) -> dict:
-    """Закрити шорт — ринкова купівля reduceOnly."""
-    ex = client()
-    params = {"reduceOnly": True, "marginMode": "isolated"}
-    return ex.create_order(symbol, "market", "buy", contracts, None, params)
-
-
-def fetch_position(symbol: str) -> dict | None:
-    """Поточна відкрита позиція по символу (або None)."""
-    ex = client()
-    for p in ex.fetch_positions([symbol]):
-        if p.get("contracts"):
-            return p
-    return None
+def close_short(venue: str, symbol: str, contracts: float) -> dict:
+    c = client(venue)
+    return c.create_order(symbol, "market", "buy", contracts, None,
+                          {"reduceOnly": True, "marginMode": "isolated"})

@@ -23,9 +23,13 @@ TELEGRAM_BOT_TOKEN = _ENV.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = _ENV.get("TELEGRAM_CHAT_ID", "").strip()
 POLL_INTERVAL = float(_ENV.get("POLL_INTERVAL", "3") or "3")
 
-# Біржа виконання (MEXC). Ключі задаються на сервері у .env, у git не потрапляють.
+# Біржі виконання. Пріоритет: шортимо на першій, де є перп. Ключі — на сервері у .env.
+VENUE_PRIORITY = [v.strip() for v in
+                  (_ENV.get("VENUE_PRIORITY", "bybit,mexc") or "bybit,mexc").split(",") if v.strip()]
 MEXC_API_KEY = _ENV.get("MEXC_API_KEY", "").strip()
 MEXC_API_SECRET = _ENV.get("MEXC_API_SECRET", "").strip()
+BYBIT_API_KEY = _ENV.get("BYBIT_API_KEY", "").strip()
+BYBIT_API_SECRET = _ENV.get("BYBIT_API_SECRET", "").strip()
 
 # --- Торгові параметри (Фаза 3) ---
 # DRY_RUN=1 → бот лише симулює угоди (реальних ордерів НЕ ставить).
