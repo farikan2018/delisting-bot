@@ -38,33 +38,35 @@ def evaluate_entry(symbol: str) -> EntryDecision:
     return EntryDecision(True, "OK", ref_price, entry_price, dropped_pct)
 
 
+def margin_profit_pct(entry: float, price: float, leverage: float) -> float:
+    """Нереалізований прибуток шорта у % від маржі (плюс = ціна впала)."""
+    return (entry - price) / entry * 100.0 * leverage
+
+
 def check_exit(position: dict, price: float, now: dt.datetime | None = None) -> tuple[bool, str]:
     """Чи закривати шорт. Повертає (закрити?, причина).
 
-    Порядок пріоритету: стоп-лос → трейлінг-тейк → макс. час.
+    Усі пороги — у % від МАРЖІ. Пріоритет: стоп-лос → трейлінг-тейк → макс. час.
     """
     entry = position["entry_price"]
-    min_price = min(position["min_price"], price)
+    lev = position["leverage"]
+    min_price = min(position["min_price"], price)  # найнижча ціна = піковий прибуток
 
-    # % руху ціни від входу (для шорта плюс = ціна впала)
-    move_pct = (entry - price) / entry * 100.0  # >0 у нашу користь
+    profit = margin_profit_pct(entry, price, lev)          # поточний прибуток, % маржі
+    peak = margin_profit_pct(entry, min_price, lev)        # піковий прибуток, % маржі
 
-    # 1) Стоп-лос: ціна зросла на STOP_LOSS_PCT проти нас
-    if -move_pct >= config.STOP_LOSS_PCT:
+    # 1) Стоп-лос: збиток досяг STOP_LOSS_MARGIN_PCT
+    if profit <= -config.STOP_LOSS_MARGIN_PCT:
         return True, "STOP_LOSS"
 
-    # 2) Trailing take-profit: якщо були достатньо в плюсі (по найнижчій ціні)
-    #    і ціна відскочила від дна на TRAIL_PCT — фіксуємо.
-    max_profit_pct = (entry - min_price) / entry * 100.0  # найкращий досягнутий плюс
-    if max_profit_pct >= config.MIN_PROFIT_TO_TRAIL_PCT:
-        bounce_pct = (price - min_price) / min_price * 100.0
-        if bounce_pct >= config.TRAIL_PCT:
-            return True, "TRAILING_TP"
+    # 2) Трейлінг-тейк: були в достатньому плюсі й віддали частину від піку
+    if peak >= config.TRAIL_ARM_MARGIN_PCT and (peak - profit) >= config.TRAIL_GIVEBACK_MARGIN_PCT:
+        return True, "TRAILING_TP"
 
     # 3) Макс. час утримання
     now = now or dt.datetime.utcnow()
     opened = _parse_ts(position["opened_at"])
-    if opened and (now - opened).total_seconds() >= config.MAX_HOLD_HOURS * 3600:
+    if opened and (now - opened).total_seconds() >= config.MAX_HOLD_MINUTES * 60:
         return True, "MAX_HOLD"
 
     return False, ""

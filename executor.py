@@ -78,17 +78,20 @@ async def open_from_signal(ticker: str) -> None:
 
 def _open_message(pos_id: int, p: dict) -> str:
     tag = "🧪 DRY-RUN" if config.DRY_RUN else "⚠️ РЕАЛ"
-    sl_price = p["entry_price"] * (1 + config.STOP_LOSS_PCT / 100)
     notional = p["margin"] * p["leverage"]
+    # стоп −X% маржі = рух ціни +X/плече % вгору
+    sl_price = p["entry_price"] * (1 + config.STOP_LOSS_MARGIN_PCT / p["leverage"] / 100)
+    sl_loss = p["margin"] * config.STOP_LOSS_MARGIN_PCT / 100
     return (
         f"🟢 <b>ВІДКРИТО ШОРТ</b> [{tag}] #{pos_id}\n"
         f"Монета: <b>{p['ticker']}</b> (<code>{p['symbol']}</code>)\n"
         f"Ціна входу: <b>{_fmt(p['entry_price'])}</b>\n"
-        f"Вже впало: <b>{p['dropped_pct']:.1f}%</b> (від макс за {config.REF_LOOKBACK_MIN} хв)\n"
+        f"Вже впало: <b>{p['dropped_pct']:.1f}%</b> (за {config.REF_LOOKBACK_MIN} хв)\n"
         f"Розмір: ${p['margin']:g} × {p['leverage']:g}x = ${notional:g} "
         f"(~{p['contracts']:g} контр.)\n"
-        f"🛑 Стоп-лос: {_fmt(sl_price)} (+{config.STOP_LOSS_PCT:g}%) | "
-        f"📉 трейлінг {config.TRAIL_PCT:g}%"
+        f"🛑 Стоп-лос: −{config.STOP_LOSS_MARGIN_PCT:g}% маржі (−${sl_loss:g}, ціна {_fmt(sl_price)})\n"
+        f"📉 Трейлінг: вмик. +{config.TRAIL_ARM_MARGIN_PCT:g}%, вихід −{config.TRAIL_GIVEBACK_MARGIN_PCT:g}% від піку\n"
+        f"⏰ Макс. утримання: {config.MAX_HOLD_MINUTES:g} хв"
     )
 
 
