@@ -45,6 +45,7 @@ class DelistingEvent:
     tickers: list[str] = field(default_factory=list)
     url: str = ""
     category: str = OTHER
+    release_ms: int | None = None  # releaseDate анонсу (для заміру затримки детекту)
 
     @property
     def actionable(self) -> bool:
@@ -104,6 +105,7 @@ async def fetch_new_events(session: aiohttp.ClientSession) -> list[DelistingEven
                 tickers=extract_tickers(title),
                 url=url,
                 category=classify(title),
+                release_ms=art.get("releaseDate"),
             )
         )
     return events

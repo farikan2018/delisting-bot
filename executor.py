@@ -8,6 +8,7 @@ import datetime as dt
 
 import config
 import exchange
+import logbook as log
 import storage
 import strategy
 import telegram_client as tg
@@ -23,18 +24,22 @@ _REASON_LABEL = {
 
 
 # ---------- ВІДКРИТТЯ ----------
-async def open_from_signal(ticker: str) -> None:
+async def open_from_signal(ticker: str, detect_latency=None) -> None:
     """Обробляє один тикер делістингу: перевірки → вхід → повідомлення."""
     venue, symbol = await asyncio.to_thread(exchange.resolve, ticker)
+    log.event("resolve", ticker=ticker, venue=venue, symbol=symbol)
     if not symbol:
         vs = "/".join(config.VENUE_PRIORITY)
+        log.event("skip", ticker=ticker, reason="no_perp", venues=vs)
         await tg.send_message(f"ℹ️ <b>{ticker}</b>: нема перпа на {vs} — пропуск.")
         return
 
     if storage.has_open_position(symbol):
+        log.event("skip", ticker=ticker, reason="already_open")
         await tg.send_message(f"ℹ️ <b>{ticker}</b>: позиція вже відкрита — пропуск.")
         return
     if storage.open_positions_count() >= config.MAX_CONCURRENT:
+        log.event("skip", ticker=ticker, reason="max_concurrent", limit=config.MAX_CONCURRENT)
         await tg.send_message(
             f"⚠️ <b>{ticker}</b>: досягнуто ліміту одночасних позицій "
             f"({config.MAX_CONCURRENT}) — пропуск."
@@ -42,7 +47,12 @@ async def open_from_signal(ticker: str) -> None:
         return
 
     decision = await asyncio.to_thread(strategy.evaluate_entry, venue, symbol)
+    log.event("entry_eval", ticker=ticker, venue=venue, symbol=symbol, ok=decision.ok,
+              reason=decision.reason, ref_price=decision.ref_price,
+              entry_price=decision.entry_price, dropped_pct=decision.dropped_pct,
+              detect_latency_sec=detect_latency)
     if not decision.ok:
+        log.event("skip", ticker=ticker, reason=f"entry:{decision.reason}")
         await tg.send_message(
             f"⏭️ <b>{ticker}</b> ({venue}): не входимо — {decision.reason}."
         )
@@ -62,8 +72,9 @@ async def open_from_signal(ticker: str) -> None:
                 exchange.open_short, venue, symbol, contracts, config.LEVERAGE
             )
             entry_price = order.get("average") or order.get("price") or entry_price
-        except Exception as e:  # noqa: BLE001
-            await tg.send_message(f"❌ <b>{ticker}</b>: помилка відкриття ордера ({venue}): {e}")
+        except Exception:  # noqa: BLE001
+            log.exception(f"open_short помилка {ticker} {venue}")
+            await tg.send_message(f"❌ <b>{ticker}</b>: помилка відкриття ордера ({venue}).")
             return
 
     pos = {
@@ -74,6 +85,10 @@ async def open_from_signal(ticker: str) -> None:
         "dropped_pct": decision.dropped_pct,
     }
     pos_id = storage.insert_position(pos)
+    log.event("open", pos_id=pos_id, ticker=ticker, venue=venue, symbol=symbol,
+              mode=_MODE, entry_price=entry_price, contracts=contracts,
+              margin=pos["margin"], leverage=pos["leverage"],
+              dropped_pct=decision.dropped_pct, detect_latency_sec=detect_latency)
     await tg.send_message(_open_message(pos_id, pos))
 
 
@@ -109,11 +124,14 @@ async def monitor_once() -> None:
             if price < pos["min_price"]:
                 storage.update_min_price(pos["id"], price)
                 pos["min_price"] = price
+            profit_pct = strategy.margin_profit_pct(pos["entry_price"], price, pos["leverage"])
+            log.event("tick", pos_id=pos["id"], symbol=pos["symbol"], price=price,
+                      min_price=pos["min_price"], profit_pct=round(profit_pct, 1))
             should_close, reason = strategy.check_exit(pos, price)
             if should_close:
                 await _do_close(pos, price, reason)
-        except Exception as e:  # noqa: BLE001
-            print(f"[monitor] помилка по {pos.get('symbol')}: {e}")
+        except Exception:  # noqa: BLE001
+            log.exception(f"monitor помилка по {pos.get('symbol')}")
 
 
 async def force_close(pos_id: int, reason: str = "MANUAL") -> bool:
@@ -134,16 +152,21 @@ async def _do_close(pos: dict, price: float, reason: str) -> None:
                 exchange.close_short, pos["venue"], pos["symbol"], pos["contracts"]
             )
             exit_price = order.get("average") or order.get("price") or price
-        except Exception as e:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
+            log.exception(f"close_short помилка #{pos['id']} {pos['symbol']}")
             await tg.send_message(
-                f"❌ <b>{pos['ticker']}</b>: помилка закриття (#{pos['id']}): {e}\n"
-                f"⚠️ Перевір позицію вручну на MEXC!"
+                f"❌ <b>{pos['ticker']}</b>: помилка закриття (#{pos['id']}).\n"
+                f"⚠️ Перевір позицію вручну на біржі!"
             )
             return
 
     pnl_usdt = pos["contracts"] * pos["contract_size"] * (pos["entry_price"] - exit_price)
     pnl_pct = (pos["entry_price"] - exit_price) / pos["entry_price"] * 100 * pos["leverage"]
     storage.close_position(pos["id"], exit_price, reason, pnl_usdt, pnl_pct)
+    log.event("close", pos_id=pos["id"], ticker=pos["ticker"], symbol=pos["symbol"],
+              mode=pos.get("mode"), reason=reason, entry_price=pos["entry_price"],
+              exit_price=exit_price, min_price=pos["min_price"],
+              pnl_usdt=round(pnl_usdt, 2), pnl_pct=round(pnl_pct, 1))
     await tg.send_message(_close_message(pos, exit_price, reason, pnl_usdt, pnl_pct))
 
 

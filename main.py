@@ -7,6 +7,7 @@
 import asyncio
 import datetime as dt
 import sys
+import time
 
 import aiohttp
 
@@ -20,6 +21,7 @@ for _stream in (sys.stdout, sys.stderr):
 import binance_watcher as bw
 import config
 import executor
+import logbook as log
 import storage
 import telegram_client as tg
 
@@ -59,25 +61,30 @@ async def _watch_loop() -> None:
                     if storage.is_seen(ev.article_id):
                         continue
                     storage.mark_seen(ev.article_id, ev.title)
-                    stamp = f"{dt.datetime.now():%H:%M:%S}"
+                    now_ms = int(time.time() * 1000)
+                    # затримка детекту: скільки минуло від публікації до нашого виявлення
+                    latency = round((now_ms - ev.release_ms) / 1000, 1) if ev.release_ms else None
                     if first_run:
-                        print(f"[{stamp}] (прайм, без сповіщення) {ev.title}")
+                        log.info(f"(прайм, без сповіщення) {ev.title}")
                         continue
-                    print(f"[{stamp}] НОВИЙ ДЕЛІСТИНГ: {ev.tickers} | {ev.title}")
+                    log.event("delisting_detected", article_id=ev.article_id,
+                              category=ev.category, tickers=ev.tickers, title=ev.title,
+                              release_ms=ev.release_ms, detected_ms=now_ms,
+                              detect_latency_sec=latency, actionable=ev.actionable)
                     await tg.send_message(_fmt_event(ev))
 
                     # Тільки для повного делістингу токена — відкриваємо шорт(и).
                     if ev.actionable and ev.tickers:
                         for ticker in ev.tickers:
                             try:
-                                await executor.open_from_signal(ticker)
-                            except Exception as e:  # noqa: BLE001
-                                print(f"[{stamp}] помилка executor {ticker}: {e}")
+                                await executor.open_from_signal(ticker, detect_latency=latency)
+                            except Exception:  # noqa: BLE001
+                                log.exception(f"executor помилка по {ticker}")
                 if first_run:
-                    print("[i] Первинні анонси позначені як бачені. Далі — тільки нові.")
+                    log.info("Первинні анонси позначені як бачені. Далі — тільки нові.")
                     first_run = False
-            except Exception as e:  # noqa: BLE001
-                print(f"[{dt.datetime.now():%H:%M:%S}] помилка watcher: {e}")
+            except Exception:  # noqa: BLE001
+                log.exception("watcher помилка")
             await asyncio.sleep(config.POLL_INTERVAL)
 
 
@@ -86,13 +93,18 @@ async def _monitor_loop() -> None:
     while True:
         try:
             await executor.monitor_once()
-        except Exception as e:  # noqa: BLE001
-            print(f"[{dt.datetime.now():%H:%M:%S}] помилка monitor: {e}")
+        except Exception:  # noqa: BLE001
+            log.exception("monitor помилка")
         await asyncio.sleep(config.EXIT_CHECK_SEC)
 
 
 async def main() -> None:
     storage.init()
+    log.event("startup", dry_run=config.DRY_RUN, venues=config.VENUE_PRIORITY,
+              margin=config.POSITION_MARGIN_USDT, leverage=config.LEVERAGE,
+              tp=config.TAKE_PROFIT_MARGIN_PCT, sl=config.STOP_LOSS_MARGIN_PCT,
+              max_hold_min=config.MAX_HOLD_MINUTES, poll=config.POLL_INTERVAL,
+              open_positions=storage.open_positions_count())
     if config.TELEGRAM_CHAT_ID:
         mode = "🧪 DRY-RUN (без реальних ордерів)" if config.DRY_RUN else "⚠️ РЕАЛЬНА ТОРГІВЛЯ"
         open_n = storage.open_positions_count()
