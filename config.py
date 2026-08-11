@@ -53,9 +53,10 @@ EXIT_CHECK_SEC = float(_ENV.get("EXIT_CHECK_SEC", "5") or "5")                  
 # Risk-ліміти
 MAX_CONCURRENT = int(_ENV.get("MAX_CONCURRENT", "3") or "3")             # макс. одночасних позицій
 
-# Binance Announcements CMS API. catalogId=161 = розділ "Delisting".
+# Binance Announcements API. catalogId=161 = розділ "Delisting".
+# apex-ендпоінт стійкіший до rate-limit (429), ніж composite; структура ідентична.
 BINANCE_CMS_URL = (
-    "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
+    "https://www.binance.com/bapi/apex/v1/public/apex/cms/article/list/query"
     "?type=1&catalogId=161&pageNo=1&pageSize=20"
 )
 

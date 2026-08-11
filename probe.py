@@ -16,17 +16,15 @@ import aiohttp
 _LOGDIR = Path(__file__).parent / "logs"
 _LOGDIR.mkdir(exist_ok=True)
 _OUT = _LOGDIR / "probe.jsonl"
-POLL = 3.0
+POLL = 5.0  # гентельно, щоб не 429-ити composite (яким користується сам бот)
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json", "lang": "en"}
 
-# Кандидати-джерела. Якщо якийсь ендпоінт віддає помилку — проба його просто пропускає.
+# Джерела для порівняння. composite (як у бота) vs apex (окремий, стійкіший сервіс).
+# WebSocket-фід додамо сюди, коли буде тест-ключ.
 SOURCES = [
     {"name": "cms_delisting",
      "url": "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
             "?type=1&catalogId=161&pageNo=1&pageSize=20"},
-    {"name": "cms_all_latest",
-     "url": "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
-            "?type=1&pageNo=1&pageSize=30"},
     {"name": "apex_delisting",
      "url": "https://www.binance.com/bapi/apex/v1/public/apex/cms/article/list/query"
             "?type=1&catalogId=161&pageNo=1&pageSize=20"},
