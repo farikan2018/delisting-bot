@@ -33,6 +33,21 @@ def client(venue: str) -> "ccxt.Exchange":
     return _clients[venue]
 
 
+def warm_ping(venue: str) -> bool:
+    """Тримає TLS-конект до біржі теплим (той самий requests.Session-пул, яким
+    піде бойовий ордер), щоб перший ордер після простою не платив ~400мс на
+    холодний TLS-handshake. Найдешевший публічний запит, без ключів."""
+    try:
+        c = client(venue)
+        if c.has.get("fetchTime"):
+            c.fetch_time()
+        else:
+            c.fetch_ticker("BTC/USDT:USDT")
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def resolve(ticker: str) -> tuple[str | None, str | None]:
     """(venue, symbol) для першої біржі з активним USDT-перпом, або (None, None)."""
     ticker = ticker.upper()

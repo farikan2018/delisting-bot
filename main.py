@@ -21,6 +21,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 import binance_watcher as bw
 import config
+import exchange
 import executor
 import logbook as log
 import storage
@@ -154,6 +155,27 @@ async def _ws_loop() -> None:
         await asyncio.sleep(5)
 
 
+async def _keepalive_loop() -> None:
+    """Тримає конекти до бірж теплими, щоб бойовий ордер не платив холодний
+    TLS-старт (~400мс). Прогрів на старті + пінг кожні KEEPALIVE_SEC."""
+    if config.KEEPALIVE_SEC <= 0:
+        log.info("keepalive вимкнено (KEEPALIVE_SEC=0)")
+        return
+    # первинний прогрів (створює клієнтів + TLS-конекти)
+    warmed = []
+    for v in config.VENUE_PRIORITY:
+        ok = await asyncio.to_thread(exchange.warm_ping, v)
+        warmed.append(f"{v}:{'ok' if ok else 'fail'}")
+    log.event("keepalive_start", venues=warmed, interval_sec=config.KEEPALIVE_SEC)
+    while True:
+        await asyncio.sleep(config.KEEPALIVE_SEC)
+        for v in config.VENUE_PRIORITY:
+            try:
+                await asyncio.to_thread(exchange.warm_ping, v)
+            except Exception:  # noqa: BLE001
+                log.exception(f"keepalive помилка {v}")
+
+
 async def _monitor_loop() -> None:
     """Паралельний цикл: стежить за відкритими позиціями й закриває за стратегією."""
     while True:
@@ -186,8 +208,8 @@ async def main() -> None:
     else:
         print("[!] TELEGRAM_CHAT_ID не заданий — сповіщення підуть у консоль. "
               "Запусти get_chat_id.py, щоб його дізнатися.")
-    # WS-тригер (основний), поллінг-сторож і monitor працюють паралельно
-    await asyncio.gather(_ws_loop(), _watch_loop(), _monitor_loop())
+    # WS-тригер (основний), поллінг-сторож, monitor і keep-alive — паралельно
+    await asyncio.gather(_ws_loop(), _watch_loop(), _monitor_loop(), _keepalive_loop())
 
 
 if __name__ == "__main__":

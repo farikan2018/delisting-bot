@@ -54,6 +54,10 @@ TAKE_PROFIT_MARGIN_PCT = float(_ENV.get("TAKE_PROFIT_MARGIN_PCT", "30") or "30")
 MAX_HOLD_MINUTES = float(_ENV.get("MAX_HOLD_MINUTES", "45") or "45")                # примусове закриття
 EXIT_CHECK_SEC = float(_ENV.get("EXIT_CHECK_SEC", "5") or "5")                      # частота перевірки позицій
 
+# Keep-alive: пінг бірж, щоб TLS-конект був теплим і бойовий ордер летів ~165мс,
+# а не ~566мс (холодний старт). 0 = вимкнути. Замір показав різницю ~400мс.
+KEEPALIVE_SEC = float(_ENV.get("KEEPALIVE_SEC", "30") or "30")
+
 # Risk-ліміти
 MAX_CONCURRENT = int(_ENV.get("MAX_CONCURRENT", "3") or "3")             # макс. одночасних позицій
 # Свіжість сигналу: угоду відкриваємо лише якщо від публікації минуло <= стільки секунд.
