@@ -31,6 +31,10 @@ MEXC_API_SECRET = _ENV.get("MEXC_API_SECRET", "").strip()
 BYBIT_API_KEY = _ENV.get("BYBIT_API_KEY", "").strip()
 BYBIT_API_SECRET = _ENV.get("BYBIT_API_SECRET", "").strip()
 
+# cryptolisting.ws — швидкий WebSocket-фід анонсів (тест-ключ FreeDelayed).
+CL_WS_KEY = _ENV.get("CL_WS_KEY", "").strip()
+CL_WS_URL = _ENV.get("CL_WS_URL", "wss://cryptolisting.ws?cex=binance").strip()
+
 # --- Торгові параметри (Фаза 3) ---
 # DRY_RUN=1 → бот лише симулює угоди (реальних ордерів НЕ ставить).
 DRY_RUN = (_ENV.get("DRY_RUN", "1").strip() != "0")

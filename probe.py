@@ -13,6 +13,8 @@ from pathlib import Path
 
 import aiohttp
 
+import config
+
 _LOGDIR = Path(__file__).parent / "logs"
 _LOGDIR.mkdir(exist_ok=True)
 _OUT = _LOGDIR / "probe.jsonl"
@@ -77,10 +79,45 @@ async def watch(session, src):
         await asyncio.sleep(POLL)
 
 
+async def watch_ws():
+    """WebSocket-фід cryptolisting.ws (push). Логує делістинги в мить отримання."""
+    if not config.CL_WS_KEY:
+        print("ws: нема CL_WS_KEY — пропускаю", flush=True)
+        return
+    while True:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.ws_connect(config.CL_WS_URL,
+                                        headers={"X-API-Key": config.CL_WS_KEY},
+                                        heartbeat=15, timeout=25) as ws:
+                    print("ws: підключено до", config.CL_WS_URL, flush=True)
+                    async for msg in ws:
+                        if msg.type != aiohttp.WSMsgType.TEXT:
+                            if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+                            continue
+                        try:
+                            d = json.loads(msg.data)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if d.get("type") == "announcement" and \
+                                d.get("listingType") in ("spot_delisting", "futures_delisting"):
+                            now_ms = int(time.time() * 1000)
+                            _log({"ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+                                  "source": "ws_cryptolisting", "title": d.get("title", ""),
+                                  "ticker": d.get("ticker"), "listingType": d.get("listingType"),
+                                  "ws_detected_us": d.get("detectedTimestampUs"),
+                                  "ws_dispatch_us": d.get("dispatchTimestampUs"),
+                                  "detected_ms": now_ms, "release_ms": None, "latency_sec": None})
+        except Exception as e:  # noqa: BLE001
+            print("ws: помилка", type(e).__name__, str(e)[:120], flush=True)
+        await asyncio.sleep(5)
+
+
 async def main():
-    print("probe: стежу за", [s["name"] for s in SOURCES], flush=True)
+    print("probe: стежу за", [s["name"] for s in SOURCES], "+ ws", flush=True)
     async with aiohttp.ClientSession() as s:
-        await asyncio.gather(*[watch(s, src) for src in SOURCES])
+        await asyncio.gather(watch_ws(), *[watch(s, src) for src in SOURCES])
 
 
 if __name__ == "__main__":
