@@ -42,11 +42,11 @@ POSITION_MARGIN_USDT = float(_ENV.get("POSITION_MARGIN_USDT", "100") or "100")
 LEVERAGE = float(_ENV.get("LEVERAGE", "3") or "3")
 
 # --- Вхід (Strategy v2) ---
-# Головний дамп стається В МОМЕНТ анонсу (до появи в API), тому backward-фільтр «вже впало»
-# ріже все. Ловимо CONTINUATION: входимо на детекті. REF_LOOKBACK_MIN лишаємо тільки для
-# інформації в повідомленні (на скільки вже впало). MAX_ALREADY_DROP_PCT=0 → фільтр вимкнено.
+# Anti-late-entry: якщо за останні REF_LOOKBACK_MIN хв ціна вже впала більше ніж на
+# MAX_ALREADY_DROP_PCT — НЕ входимо (обвал уже стався, ризик відскоку). З WS-детектом (~3-4с)
+# цей фільтр адекватний: відсіює лише блискавичні обвали. 0 = вимкнути фільтр.
 REF_LOOKBACK_MIN = int(_ENV.get("REF_LOOKBACK_MIN", "5") or "5")
-MAX_ALREADY_DROP_PCT = float(_ENV.get("MAX_ALREADY_DROP_PCT", "0") or "0")  # 0 = не відсіювати
+MAX_ALREADY_DROP_PCT = float(_ENV.get("MAX_ALREADY_DROP_PCT", "8") or "8")
 
 # --- Вихід (усе у % від МАРЖІ) ---
 STOP_LOSS_MARGIN_PCT = float(_ENV.get("STOP_LOSS_MARGIN_PCT", "30") or "30")        # збиток -30% маржі → стоп
