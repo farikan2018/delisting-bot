@@ -56,6 +56,9 @@ EXIT_CHECK_SEC = float(_ENV.get("EXIT_CHECK_SEC", "5") or "5")                  
 
 # Risk-ліміти
 MAX_CONCURRENT = int(_ENV.get("MAX_CONCURRENT", "3") or "3")             # макс. одночасних позицій
+# Свіжість сигналу: угоду відкриваємо лише якщо від публікації минуло <= стільки секунд.
+# WS-фід дає ~3-4с → торгує. Поллінг ~126с → лише попереджає, не торгує.
+MAX_SIGNAL_AGE_SEC = float(_ENV.get("MAX_SIGNAL_AGE_SEC", "60") or "60")
 
 # Binance Announcements API. catalogId=161 = розділ "Delisting".
 # apex-ендпоінт стійкіший до rate-limit (429), ніж composite; структура ідентична.
