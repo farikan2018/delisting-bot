@@ -19,6 +19,8 @@ _MODE = "dry" if config.DRY_RUN else "real"
 
 # Фонові задачі (Telegram-сповіщення) — щоб НЕ блокувати гарячий шлях відкриття.
 _bg_tasks: set = set()
+# Комісія входу по pos_id (у памʼяті процесу) — для net-PnL при закритті.
+_entry_fee: dict = {}
 
 
 async def _safe(coro) -> None:
@@ -112,16 +114,28 @@ async def open_from_signal(ticker: str, detect_latency=None, real=None, margin=N
     contract_size = exchange.market_meta(venue, symbol)["contract_size"]
 
     # --- ОРДЕР якнайраніше (плече вже виставлено вище) ---
+    entry_fee = None
     if real:
         t_ord = time.perf_counter()
         try:
             order = await asyncio.to_thread(exchange.open_short, venue, symbol, contracts)
-            entry_price = order.get("average") or order.get("price") or entry_price
         except Exception:  # noqa: BLE001
             log.exception(f"open_short помилка {ticker} {venue}")
             fire(tg.send_message(f"❌ <b>{ticker}</b>: помилка відкриття ордера ({venue})."))
             return
-        log.event("order_latency", ticker=ticker, order_ms=round((time.perf_counter() - t_ord) * 1000))
+        order_ms = round((time.perf_counter() - t_ord) * 1000)
+        # реальний fill (avg + комісія) — окремий запит ПІСЛЯ ордера, поза критичним шляхом
+        avg = order.get("average") or order.get("price")
+        fee = (order.get("fee") or {}).get("cost")
+        oid = order.get("id")
+        if (avg is None or fee is None) and oid:
+            f_avg, f_fee = await asyncio.to_thread(exchange.order_fill, venue, symbol, oid)
+            avg = avg or f_avg
+            fee = fee if fee is not None else f_fee
+        if avg:
+            entry_price = avg
+        entry_fee = fee
+        log.event("order_latency", ticker=ticker, order_ms=order_ms, fill_price=avg, fee=fee)
 
     pos = {
         "ticker": ticker, "symbol": symbol, "venue": venue, "mode": mode,
@@ -131,9 +145,11 @@ async def open_from_signal(ticker: str, detect_latency=None, real=None, margin=N
         "dropped_pct": decision.dropped_pct,
     }
     pos_id = storage.insert_position(pos)
+    if entry_fee is not None:
+        _entry_fee[pos_id] = entry_fee  # комісія входу — для чесного net-PnL при закритті
     log.event("open", pos_id=pos_id, ticker=ticker, venue=venue, symbol=symbol,
               mode=mode, entry_price=entry_price, contracts=contracts,
-              margin=margin, leverage=config.LEVERAGE,
+              margin=margin, leverage=config.LEVERAGE, entry_fee=entry_fee,
               dropped_pct=decision.dropped_pct, detect_latency_sec=detect_latency)
     fire(tg.send_message(_open_message(pos_id, pos)))  # сповіщення — у фоні
 
@@ -192,12 +208,12 @@ async def force_close(pos_id: int, reason: str = "MANUAL") -> bool:
 
 async def _do_close(pos: dict, price: float, reason: str) -> None:
     exit_price = price
+    exit_fee = None
     if pos.get("mode") == "real":  # закриваємо реально лише РЕАЛЬНІ позиції (не глоб. DRY_RUN)
         try:
             order = await asyncio.to_thread(
                 exchange.close_short, pos["venue"], pos["symbol"], pos["contracts"]
             )
-            exit_price = order.get("average") or order.get("price") or price
         except Exception:  # noqa: BLE001
             log.exception(f"close_short помилка #{pos['id']} {pos['symbol']}")
             await tg.send_message(
@@ -205,28 +221,44 @@ async def _do_close(pos: dict, price: float, reason: str) -> None:
                 f"⚠️ Перевір позицію вручну на біржі!"
             )
             return
+        avg = order.get("average") or order.get("price")
+        fee = (order.get("fee") or {}).get("cost")
+        oid = order.get("id")
+        if (avg is None or fee is None) and oid:
+            f_avg, f_fee = await asyncio.to_thread(
+                exchange.order_fill, pos["venue"], pos["symbol"], oid)
+            avg = avg or f_avg
+            fee = fee if fee is not None else f_fee
+        exit_price = avg or price
+        exit_fee = fee
 
-    pnl_usdt = pos["contracts"] * pos["contract_size"] * (pos["entry_price"] - exit_price)
-    pnl_pct = (pos["entry_price"] - exit_price) / pos["entry_price"] * 100 * pos["leverage"]
+    price_pnl = pos["contracts"] * pos["contract_size"] * (pos["entry_price"] - exit_price)
+    entry_fee = _entry_fee.pop(pos["id"], exit_fee)  # памʼять процесу; фолбек ~exit_fee
+    fees = (entry_fee or 0.0) + (exit_fee or 0.0)
+    pnl_usdt = price_pnl - fees
+    pnl_pct = pnl_usdt / pos["margin"] * 100 if pos.get("margin") else 0.0
     storage.close_position(pos["id"], exit_price, reason, pnl_usdt, pnl_pct)
     log.event("close", pos_id=pos["id"], ticker=pos["ticker"], symbol=pos["symbol"],
               mode=pos.get("mode"), reason=reason, entry_price=pos["entry_price"],
               exit_price=exit_price, min_price=pos["min_price"],
-              pnl_usdt=round(pnl_usdt, 2), pnl_pct=round(pnl_pct, 1))
-    await tg.send_message(_close_message(pos, exit_price, reason, pnl_usdt, pnl_pct))
+              price_pnl=round(price_pnl, 4), fees=round(fees, 4),
+              pnl_usdt=round(pnl_usdt, 4), pnl_pct=round(pnl_pct, 1))
+    await tg.send_message(_close_message(pos, exit_price, reason, pnl_usdt, pnl_pct, fees))
 
 
 def _close_message(p: dict, exit_price: float, reason: str,
-                   pnl_usdt: float, pnl_pct: float) -> str:
+                   pnl_usdt: float, pnl_pct: float, fees: float = 0.0) -> str:
     tag = "⚠️ РЕАЛ" if p.get("mode") == "real" else "🧪 DRY-RUN"
     emoji = "✅" if pnl_usdt >= 0 else "🔻"
     dur = _duration(p.get("opened_at"))
+    fee_line = f"Комісії: −{fees:.4f} USDT\n" if fees else ""
     return (
         f"{emoji} <b>ЗАКРИТО ШОРТ</b> [{tag}] #{p['id']}\n"
         f"Монета: <b>{p['ticker']}</b> (<code>{p['symbol']}</code>)\n"
         f"Причина: <b>{_REASON_LABEL.get(reason, reason)}</b>\n"
         f"Вхід: {_fmt(p['entry_price'])} → Вихід: {_fmt(exit_price)}\n"
-        f"Прибуток: <b>{pnl_usdt:+.2f} USDT</b> ({pnl_pct:+.1f}% від маржі)\n"
+        f"{fee_line}"
+        f"Прибуток (net): <b>{pnl_usdt:+.4f} USDT</b> ({pnl_pct:+.1f}% від маржі)\n"
         f"Тривалість: {dur}"
     )
 

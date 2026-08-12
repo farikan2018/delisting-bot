@@ -36,16 +36,36 @@ def client(venue: str) -> "ccxt.Exchange":
 def warm_ping(venue: str) -> bool:
     """Тримає TLS-конект до біржі теплим (той самий requests.Session-пул, яким
     піде бойовий ордер), щоб перший ордер після простою не платив ~400мс на
-    холодний TLS-handshake. Найдешевший публічний запит, без ключів."""
+    холодний TLS-handshake. Публічний пінг + (якщо є ключі) підписаний виклик,
+    щоб теплим був і auth/POST-шлях бойового ордера."""
     try:
         c = client(venue)
         if c.has.get("fetchTime"):
             c.fetch_time()
         else:
             c.fetch_ticker("BTC/USDT:USDT")
+        key, _sec = _KEYS.get(venue, lambda: ("", ""))()
+        if key:  # підписаний прогрів (той самий конект, що й create_order)
+            try:
+                c.fetch_balance()
+            except Exception:  # noqa: BLE001
+                pass
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def order_fill(venue: str, symbol: str, order_id: str) -> tuple:
+    """Реальна середня ціна виконання + комісія ордера (avgPrice/fee) — для чесного
+    логування входу/виходу зі слиппеджем. Окремий запит ПІСЛЯ ордера (не на критичному
+    шляху виконання). Повертає (avg_price|None, fee_cost|None)."""
+    try:
+        o = client(venue).fetch_order(order_id, symbol)
+        avg = o.get("average") or o.get("price")
+        fee = (o.get("fee") or {}).get("cost")
+        return (float(avg) if avg else None, float(fee) if fee is not None else None)
+    except Exception:  # noqa: BLE001
+        return (None, None)
 
 
 def resolve(ticker: str) -> tuple[str | None, str | None]:
