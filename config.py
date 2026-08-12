@@ -47,6 +47,9 @@ TG_FEED_CHANNEL = _ENV.get("TG_FEED_CHANNEL", "CLWfeed").strip()
 DRY_RUN = (_ENV.get("DRY_RUN", "1").strip() != "0")
 POSITION_MARGIN_USDT = float(_ENV.get("POSITION_MARGIN_USDT", "100") or "100")
 LEVERAGE = float(_ENV.get("LEVERAGE", "3") or "3")
+# Маржа для РЕАЛЬНОГО тест-шорта через /test_short (незалежно від авто-DRY_RUN).
+# $2 × 3x = $6 позиції — щоб пройти можливий мін. ордер Bybit (~$5). Ризик при стопі ~$0.60.
+TEST_MARGIN_USDT = float(_ENV.get("TEST_MARGIN_USDT", "2") or "2")
 
 # --- Вхід (Strategy v2) ---
 # Anti-late-entry: якщо за останні REF_LOOKBACK_MIN хв ціна вже впала більше ніж на

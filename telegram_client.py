@@ -32,11 +32,17 @@ async def send_message(text: str, chat_id: str | None = None) -> bool:
             return False
 
 
-async def get_updates() -> list[dict]:
-    """Повертає останні апдейти — використовуємо, щоб дізнатися chat_id."""
+async def get_updates(offset: int | None = None, timeout: int = 0) -> list[dict]:
+    """Апдейти. offset — з якого update_id читати; timeout>0 → long-poll (сек)."""
+    params: dict = {}
+    if offset is not None:
+        params["offset"] = offset
+    if timeout:
+        params["timeout"] = timeout
     async with aiohttp.ClientSession() as s:
         async with s.get(
-            f"{_API}/getUpdates", timeout=aiohttp.ClientTimeout(total=15)
+            f"{_API}/getUpdates", params=params,
+            timeout=aiohttp.ClientTimeout(total=timeout + 15),
         ) as r:
             data = await r.json()
             return data.get("result", []) if data.get("ok") else []

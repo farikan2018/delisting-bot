@@ -101,15 +101,32 @@ def contracts_for(venue: str, symbol: str, notional_usdt: float, price: float) -
         return raw
 
 
-# ---- РЕАЛЬНІ торгові методи (лише коли DRY_RUN=False) ----
+# ---- РЕАЛЬНІ торгові методи (лише коли real-режим) ----
+_leveraged: set = set()  # (venue,symbol) де плече вже виставлено — щоб не бити API двічі
+
+
 def set_leverage_safe(venue: str, symbol: str, leverage: float) -> bool:
-    """Виставляє плече. Кличемо ПАРАЛЕЛЬНО у фазі підготовки (до ордера), тому
-    окремо від open_short. Часто кидає 'leverage not modified' — це не помилка."""
+    """Виставляє плече. 'leverage not modified' = вже стоїть → вважаємо успіхом."""
     try:
         client(venue).set_leverage(int(leverage), symbol)
         return True
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        msg = str(e).lower()
+        if "not modified" in msg or "110043" in msg:
+            return True
         return False
+
+
+def ensure_leverage(venue: str, symbol: str, leverage: float) -> bool:
+    """Важіль 1b: пре-установка плеча з кешем. Перший раз — мережевий виклик,
+    далі миттєво (символ у _leveraged). Так бойовий ордер не платить за set_leverage."""
+    key = (venue, symbol)
+    if key in _leveraged:
+        return True
+    if set_leverage_safe(venue, symbol, leverage):
+        _leveraged.add(key)
+        return True
+    return False
 
 
 def open_short(venue: str, symbol: str, contracts: float, leverage: float | None = None) -> dict:

@@ -5,6 +5,7 @@ DRY_RUN=False: реальні ринкові ордери на MEXC (ізоль�
 """
 import asyncio
 import datetime as dt
+import time
 
 import config
 import exchange
@@ -42,10 +43,17 @@ _REASON_LABEL = {
 
 
 # ---------- ВІДКРИТТЯ ----------
-async def open_from_signal(ticker: str, detect_latency=None) -> None:
+async def open_from_signal(ticker: str, detect_latency=None, real=None, margin=None) -> None:
     """Обробляє один тикер делістингу. ГАРЯЧИЙ ШЛЯХ оптимізовано:
     підготовка (ціна+ref+плече) — паралельно; ордер — якнайраніше;
-    Telegram-сповіщення — у фоні (fire), не блокують відкриття."""
+    Telegram-сповіщення — у фоні (fire), не блокують відкриття.
+
+    real:   None → за config.DRY_RUN; True → примусово РЕАЛЬНИЙ ордер (для /test_short
+            навіть коли авто-режим у dry); False → симуляція.
+    margin: None → config.POSITION_MARGIN_USDT; інакше — задана маржа (для тесту $)."""
+    real = (not config.DRY_RUN) if real is None else real
+    margin = config.POSITION_MARGIN_USDT if margin is None else margin
+    mode = "real" if real else "dry"
     venue, symbol = await asyncio.to_thread(exchange.resolve, ticker)
     log.event("resolve", ticker=ticker, venue=venue, symbol=symbol)
     if not symbol:
@@ -75,13 +83,13 @@ async def open_from_signal(ticker: str, detect_latency=None) -> None:
             entry_price, src = gp[0], f"cache({gp[1]:.1f}s)"
             ref_price = pricecache.reference_high(raw, config.REF_LOOKBACK_MIN)
 
-    # Мережеві задачі: фетч ціни+ref лише якщо кеш-промах; плече — лише в реалі.
+    # Мережеві задачі: фетч ціни+ref лише якщо кеш-промах; плече — лише в реалі (лінива пре-установка).
     prep = []
     if entry_price is None:
         prep.append(asyncio.to_thread(exchange.get_last_price, venue, symbol))
         prep.append(asyncio.to_thread(exchange.reference_high, venue, symbol, config.REF_LOOKBACK_MIN))
-    if not config.DRY_RUN:
-        prep.append(asyncio.to_thread(exchange.set_leverage_safe, venue, symbol, config.LEVERAGE))
+    if real:
+        prep.append(asyncio.to_thread(exchange.ensure_leverage, venue, symbol, config.LEVERAGE))
     prep_res = await asyncio.gather(*prep) if prep else []
     if entry_price is None:
         entry_price, ref_price = prep_res[0], prep_res[1]
@@ -98,13 +106,14 @@ async def open_from_signal(ticker: str, detect_latency=None) -> None:
         return
 
     entry_price = decision.entry_price
-    notional = config.POSITION_MARGIN_USDT * config.LEVERAGE
+    notional = margin * config.LEVERAGE
     # Розмір позиції — з уже завантажених markets (в памʼяті, без мережі).
     contracts = exchange.contracts_for(venue, symbol, notional, entry_price)
     contract_size = exchange.market_meta(venue, symbol)["contract_size"]
 
-    # --- ОРДЕР якнайраніше (плече вже виставлено паралельно вище) ---
-    if not config.DRY_RUN:
+    # --- ОРДЕР якнайраніше (плече вже виставлено вище) ---
+    if real:
+        t_ord = time.perf_counter()
         try:
             order = await asyncio.to_thread(exchange.open_short, venue, symbol, contracts)
             entry_price = order.get("average") or order.get("price") or entry_price
@@ -112,24 +121,25 @@ async def open_from_signal(ticker: str, detect_latency=None) -> None:
             log.exception(f"open_short помилка {ticker} {venue}")
             fire(tg.send_message(f"❌ <b>{ticker}</b>: помилка відкриття ордера ({venue})."))
             return
+        log.event("order_latency", ticker=ticker, order_ms=round((time.perf_counter() - t_ord) * 1000))
 
     pos = {
-        "ticker": ticker, "symbol": symbol, "venue": venue, "mode": _MODE,
-        "margin": config.POSITION_MARGIN_USDT, "leverage": config.LEVERAGE,
+        "ticker": ticker, "symbol": symbol, "venue": venue, "mode": mode,
+        "margin": margin, "leverage": config.LEVERAGE,
         "contracts": contracts, "contract_size": contract_size,
         "ref_price": decision.ref_price, "entry_price": entry_price,
         "dropped_pct": decision.dropped_pct,
     }
     pos_id = storage.insert_position(pos)
     log.event("open", pos_id=pos_id, ticker=ticker, venue=venue, symbol=symbol,
-              mode=_MODE, entry_price=entry_price, contracts=contracts,
-              margin=pos["margin"], leverage=pos["leverage"],
+              mode=mode, entry_price=entry_price, contracts=contracts,
+              margin=margin, leverage=config.LEVERAGE,
               dropped_pct=decision.dropped_pct, detect_latency_sec=detect_latency)
     fire(tg.send_message(_open_message(pos_id, pos)))  # сповіщення — у фоні
 
 
 def _open_message(pos_id: int, p: dict) -> str:
-    tag = "🧪 DRY-RUN" if config.DRY_RUN else "⚠️ РЕАЛ"
+    tag = "⚠️ РЕАЛ" if p.get("mode") == "real" else "🧪 DRY-RUN"
     notional = p["margin"] * p["leverage"]
     lev = p["leverage"]
     sl_price = p["entry_price"] * (1 + config.STOP_LOSS_MARGIN_PCT / lev / 100)   # стоп: ціна вгору
@@ -182,7 +192,7 @@ async def force_close(pos_id: int, reason: str = "MANUAL") -> bool:
 
 async def _do_close(pos: dict, price: float, reason: str) -> None:
     exit_price = price
-    if not config.DRY_RUN:
+    if pos.get("mode") == "real":  # закриваємо реально лише РЕАЛЬНІ позиції (не глоб. DRY_RUN)
         try:
             order = await asyncio.to_thread(
                 exchange.close_short, pos["venue"], pos["symbol"], pos["contracts"]
@@ -208,7 +218,7 @@ async def _do_close(pos: dict, price: float, reason: str) -> None:
 
 def _close_message(p: dict, exit_price: float, reason: str,
                    pnl_usdt: float, pnl_pct: float) -> str:
-    tag = "🧪 DRY-RUN" if config.DRY_RUN else "⚠️ РЕАЛ"
+    tag = "⚠️ РЕАЛ" if p.get("mode") == "real" else "🧪 DRY-RUN"
     emoji = "✅" if pnl_usdt >= 0 else "🔻"
     dur = _duration(p.get("opened_at"))
     return (

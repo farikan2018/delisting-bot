@@ -178,6 +178,105 @@ async def _keepalive_loop() -> None:
                 log.exception(f"keepalive помилка {v}")
 
 
+_HELP = (
+    "🎛 <b>Команди</b>\n"
+    "/status — стан бота\n"
+    "/positions — відкриті позиції\n"
+    "/test_short СИМВОЛ — <b>РЕАЛЬНИЙ</b> тест-шорт на ${margin:g} (напр. /test_short DOGE)\n"
+    "/close ID — закрити позицію за id\n"
+    "/panic — 🛑 закрити ВСІ позиції\n"
+    "/help — ця довідка"
+)
+
+
+async def _handle_command(text: str) -> None:
+    parts = text.split()
+    cmd = parts[0].lower().lstrip("/").split("@")[0]
+    log.event("tg_command", cmd=cmd, text=text)
+
+    if cmd in ("help", "start"):
+        await tg.send_message(_HELP.format(margin=config.TEST_MARGIN_USDT))
+
+    elif cmd == "status":
+        pcs = pricecache.stats()
+        open_n = storage.open_positions_count()
+        mode = "🧪 DRY (авто)" if config.DRY_RUN else "⚠️ РЕАЛ (авто)"
+        await tg.send_message(
+            "📊 <b>Стан</b>\n"
+            f"Авто-режим: {mode}\n"
+            f"Тригер: {'⚡ WS' if config.CL_WS_KEY else '🐌 поллінг'}\n"
+            f"Price-cache: {pcs['symbols']} симв., WS-оновлень {pcs['ws_msgs']}\n"
+            f"Відкритих позицій: {open_n}\n"
+            f"Тест-маржа: ${config.TEST_MARGIN_USDT:g} × {config.LEVERAGE:g}x"
+        )
+
+    elif cmd == "positions":
+        rows = storage.get_open_positions()
+        if not rows:
+            await tg.send_message("Відкритих позицій немає.")
+        else:
+            lines = [f"#{p['id']} {p['ticker']} @{p.get('venue')} "
+                     f"[{p.get('mode')}] вхід {p['entry_price']}" for p in rows]
+            await tg.send_message("<b>Відкриті позиції:</b>\n" + "\n".join(lines))
+
+    elif cmd in ("test_short", "testshort"):
+        sym = parts[1].upper() if len(parts) > 1 else "DOGE"
+        await tg.send_message(
+            f"⏳ Відкриваю <b>РЕАЛЬНИЙ</b> тест-шорт <b>{sym}</b> "
+            f"на ${config.TEST_MARGIN_USDT:g} × {config.LEVERAGE:g}x…"
+        )
+        await executor.open_from_signal(sym, real=True, margin=config.TEST_MARGIN_USDT)
+
+    elif cmd == "close":
+        if len(parts) < 2 or not parts[1].isdigit():
+            await tg.send_message("Вкажи id: /close 12")
+        else:
+            ok = await executor.force_close(int(parts[1]))
+            await tg.send_message("✅ закрито" if ok else "❌ не знайдено такої відкритої позиції")
+
+    elif cmd == "panic":
+        rows = storage.get_open_positions()
+        if not rows:
+            await tg.send_message("Немає що закривати.")
+        else:
+            await tg.send_message(f"🛑 Закриваю ВСІ позиції ({len(rows)})…")
+            for p in rows:
+                await executor.force_close(p["id"], reason="MANUAL")
+    else:
+        await tg.send_message("Невідома команда. /help")
+
+
+async def _command_loop() -> None:
+    """Приймання команд Telegram (long-poll). Реагує лише на повідомлення з нашого chat_id."""
+    if not (config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID):
+        return
+    # прайм: пропускаємо старий backlog, щоб не виконати застарілі команди
+    offset = None
+    try:
+        old = await tg.get_updates(timeout=0)
+        if old:
+            offset = old[-1]["update_id"] + 1
+    except Exception:  # noqa: BLE001
+        pass
+    log.event("command_loop_start")
+    while True:
+        try:
+            updates = await tg.get_updates(offset=offset, timeout=25)
+            for u in updates:
+                offset = u["update_id"] + 1
+                msg = u.get("message") or u.get("edited_message")
+                if not msg:
+                    continue
+                if str(msg.get("chat", {}).get("id")) != str(config.TELEGRAM_CHAT_ID):
+                    continue  # чужий чат — ігноруємо
+                text = (msg.get("text") or "").strip()
+                if text.startswith("/"):
+                    await _handle_command(text)
+        except Exception:  # noqa: BLE001
+            log.exception("command loop помилка")
+            await asyncio.sleep(3)
+
+
 async def _monitor_loop() -> None:
     """Паралельний цикл: стежить за відкритими позиціями й закриває за стратегією."""
     while True:
@@ -210,9 +309,10 @@ async def main() -> None:
     else:
         print("[!] TELEGRAM_CHAT_ID не заданий — сповіщення підуть у консоль. "
               "Запусти get_chat_id.py, щоб його дізнатися.")
-    # WS-тригер, поллінг-сторож, monitor, keep-alive, price-cache (знімок + WS) — паралельно
+    # WS-тригер, поллінг-сторож, monitor, keep-alive, price-cache, Telegram-команди — паралельно
     await asyncio.gather(_ws_loop(), _watch_loop(), _monitor_loop(),
-                         _keepalive_loop(), pricecache.run(), pricecache.ws_run())
+                         _keepalive_loop(), pricecache.run(), pricecache.ws_run(),
+                         _command_loop())
 
 
 if __name__ == "__main__":
