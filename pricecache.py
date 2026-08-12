@@ -9,6 +9,7 @@
 запиту на гарячому шляху відкриття. Ключ — сирий bybit-символ (напр. "DOGEUSDT").
 """
 import asyncio
+import json
 import time
 
 import aiohttp
@@ -17,7 +18,9 @@ import config
 import logbook as log
 
 _SNAP_URL = "https://api.bybit.com/v5/market/tickers?category=linear"
+_WS_URL = "wss://stream.bybit.com/v5/public/linear"
 _HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+_ws_msgs = 0  # лічильник WS-оновлень (для heartbeat-статистики)
 
 _last: dict[str, float] = {}        # sym -> ціна
 _last_ts: dict[str, int] = {}       # sym -> коли оновлено (ms)
@@ -63,7 +66,56 @@ def reference_high(sym: str, lookback_min: int):
 
 def stats() -> dict:
     age = (_now_ms() - _updated_ms) / 1000.0 if _updated_ms else None
-    return {"symbols": len(_last), "last_update_age_sec": age}
+    return {"symbols": len(_last), "last_update_age_sec": age, "ws_msgs": _ws_msgs}
+
+
+async def ws_run() -> None:
+    """РЕАЛ-ТАЙМ шар: WS-стрім tickers усіх Bybit-перпів. Оновлює кеш у мить зміни ціни.
+    Символи бере зі знімка (run() сідить їх першим). Ціну — з поля lastPrice дельти."""
+    global _ws_msgs
+    if not config.PRICECACHE_WS:
+        return
+    while True:
+        try:
+            # чекаємо, поки знімок заповнить перелік символів (сід)
+            for _ in range(30):
+                if _last:
+                    break
+                await asyncio.sleep(1)
+            symbols = list(_last.keys())
+            if not symbols:
+                await asyncio.sleep(3)
+                continue
+            async with aiohttp.ClientSession() as s:
+                async with s.ws_connect(_WS_URL, heartbeat=20, timeout=25) as ws:
+                    # підписка чанками (обмеження на кількість args у запиті)
+                    for i in range(0, len(symbols), 50):
+                        args = [f"tickers.{sym}" for sym in symbols[i:i + 50]]
+                        await ws.send_json({"op": "subscribe", "args": args})
+                    log.event("pricecache_ws_connected", topics=len(symbols))
+                    async for msg in ws:
+                        if msg.type != aiohttp.WSMsgType.TEXT:
+                            if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+                            continue
+                        try:
+                            d = json.loads(msg.data)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        topic = d.get("topic", "")
+                        if not topic.startswith("tickers."):
+                            continue
+                        lp = (d.get("data") or {}).get("lastPrice")
+                        if lp is None:
+                            continue  # дельта без зміни ціни
+                        try:
+                            _update(topic.split(".", 1)[1], float(lp), _now_ms())
+                            _ws_msgs += 1
+                        except (ValueError, IndexError):
+                            continue
+        except Exception:  # noqa: BLE001
+            log.exception("pricecache WS помилка")
+        await asyncio.sleep(5)
 
 
 async def run() -> None:

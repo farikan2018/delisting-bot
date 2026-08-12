@@ -70,6 +70,9 @@ KEEPALIVE_SEC = float(_ENV.get("KEEPALIVE_SEC", "30") or "30")
 # шляху). Якщо ціна старіша за MAX_AGE — не довіряємо, фолбек на REST. 0 = вимкнути кеш.
 PRICECACHE_POLL_SEC = float(_ENV.get("PRICECACHE_POLL_SEC", "2") or "2")
 PRICECACHE_MAX_AGE_SEC = float(_ENV.get("PRICECACHE_MAX_AGE_SEC", "10") or "10")
+# WS реал-тайм шар: стрім tickers усіх перпів (ціна оновлюється в реальному часі).
+# 1=увімк (максимальна свіжість, основа для детектора обвалу). Знімок лишається сідом/страховкою.
+PRICECACHE_WS = (_ENV.get("PRICECACHE_WS", "1").strip() != "0")
 
 # Risk-ліміти
 MAX_CONCURRENT = int(_ENV.get("MAX_CONCURRENT", "3") or "3")             # макс. одночасних позицій

@@ -210,9 +210,9 @@ async def main() -> None:
     else:
         print("[!] TELEGRAM_CHAT_ID не заданий — сповіщення підуть у консоль. "
               "Запусти get_chat_id.py, щоб його дізнатися.")
-    # WS-тригер (основний), поллінг-сторож, monitor, keep-alive і price-cache — паралельно
+    # WS-тригер, поллінг-сторож, monitor, keep-alive, price-cache (знімок + WS) — паралельно
     await asyncio.gather(_ws_loop(), _watch_loop(), _monitor_loop(),
-                         _keepalive_loop(), pricecache.run())
+                         _keepalive_loop(), pricecache.run(), pricecache.ws_run())
 
 
 if __name__ == "__main__":
