@@ -114,10 +114,57 @@ async def watch_ws():
         await asyncio.sleep(5)
 
 
+async def watch_telegram():
+    """Userbot-слухач каналу @CLWfeed (Telethon). Логує кожен пост у мить отримання.
+    Порівнюємо його receipt-time з WS та CMS. Тільки заміри, не торгує."""
+    if not (config.TG_API_ID and config.TG_API_HASH and config.TG_SESSION):
+        print("tg: нема TG_API_ID/HASH/SESSION — пропускаю", flush=True)
+        return
+    try:
+        from telethon import TelegramClient, events
+        from telethon.sessions import StringSession
+        from telethon.tl.functions.channels import JoinChannelRequest
+    except Exception as e:  # noqa: BLE001
+        print("tg: telethon не встановлено:", e, flush=True)
+        return
+
+    client = TelegramClient(StringSession(config.TG_SESSION),
+                            config.TG_API_ID, config.TG_API_HASH)
+
+    @client.on(events.NewMessage(chats=config.TG_FEED_CHANNEL))
+    async def _handler(event):  # noqa: ANN001
+        now_ms = int(time.time() * 1000)
+        text = (event.message.message or "").replace("\n", " ")
+        low = text.lower()
+        is_binance = "binance" in low
+        is_delist = "delist" in low
+        _log({"ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+              "source": "tg_clwfeed", "title": text[:200],
+              "is_binance": is_binance, "is_delisting": is_delist,
+              "msg_date": event.message.date.isoformat() if event.message.date else None,
+              "detected_ms": now_ms, "release_ms": None, "latency_sec": None})
+
+    while True:
+        try:
+            await client.start()
+            try:
+                await client(JoinChannelRequest(config.TG_FEED_CHANNEL))
+            except Exception:  # noqa: BLE001
+                pass  # вже підписані / приватний — ігноруємо
+            me = await client.get_me()
+            print(f"tg: userbot підключено як @{me.username} → слухаю @{config.TG_FEED_CHANNEL}",
+                  flush=True)
+            await client.run_until_disconnected()
+        except Exception as e:  # noqa: BLE001
+            print("tg: помилка", type(e).__name__, str(e)[:120], flush=True)
+        await asyncio.sleep(5)
+
+
 async def main():
-    print("probe: стежу за", [s["name"] for s in SOURCES], "+ ws", flush=True)
+    print("probe: стежу за", [s["name"] for s in SOURCES], "+ ws + tg", flush=True)
     async with aiohttp.ClientSession() as s:
-        await asyncio.gather(watch_ws(), *[watch(s, src) for src in SOURCES])
+        await asyncio.gather(watch_ws(), watch_telegram(),
+                             *[watch(s, src) for src in SOURCES])
 
 
 if __name__ == "__main__":
