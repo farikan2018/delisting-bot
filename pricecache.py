@@ -14,6 +14,7 @@ import time
 import aiohttp
 
 import config
+import logbook as log
 
 _SNAP_URL = "https://api.bybit.com/v5/market/tickers?category=linear"
 _HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
@@ -69,7 +70,9 @@ async def run() -> None:
     """Фоновий цикл знімків. Публічні дані — без ключів."""
     global _updated_ms
     if config.PRICECACHE_POLL_SEC <= 0:
+        log.info("price-cache вимкнено (PRICECACHE_POLL_SEC=0)")
         return
+    cycle, primed = 0, False
     async with aiohttp.ClientSession() as s:  # персистентна сесія → теплий TLS
         while True:
             try:
@@ -84,6 +87,12 @@ async def run() -> None:
                             except (KeyError, ValueError, TypeError):
                                 continue
                         _updated_ms = now_ms
+                        if not primed:  # перший успішний знімок
+                            log.event("pricecache_primed", **stats())
+                            primed = True
             except Exception:  # noqa: BLE001
                 pass
+            cycle += 1
+            if cycle % 150 == 0:  # ~кожні 5 хв — heartbeat, що кеш живий
+                log.event("pricecache_stats", **stats())
             await asyncio.sleep(config.PRICECACHE_POLL_SEC)
