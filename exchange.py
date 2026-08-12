@@ -94,14 +94,21 @@ def contracts_for(venue: str, symbol: str, notional_usdt: float, price: float) -
 
 
 # ---- РЕАЛЬНІ торгові методи (лише коли DRY_RUN=False) ----
-def open_short(venue: str, symbol: str, contracts: float, leverage: float) -> dict:
-    c = client(venue)
+def set_leverage_safe(venue: str, symbol: str, leverage: float) -> bool:
+    """Виставляє плече. Кличемо ПАРАЛЕЛЬНО у фазі підготовки (до ордера), тому
+    окремо від open_short. Часто кидає 'leverage not modified' — це не помилка."""
     try:
-        c.set_leverage(int(leverage), symbol)
+        client(venue).set_leverage(int(leverage), symbol)
+        return True
     except Exception:  # noqa: BLE001
-        pass
-    params = {"marginMode": "isolated"}
-    return c.create_order(symbol, "market", "sell", contracts, None, params)
+        return False
+
+
+def open_short(venue: str, symbol: str, contracts: float, leverage: float | None = None) -> dict:
+    """Лише ринковий ордер. Плече виставляється заздалегідь (set_leverage_safe),
+    щоб не додавати мережевий раунд у момент відкриття."""
+    return client(venue).create_order(symbol, "market", "sell", contracts, None,
+                                      {"marginMode": "isolated"})
 
 
 def close_short(venue: str, symbol: str, contracts: float) -> dict:

@@ -111,11 +111,12 @@ async def _handle_ws_delisting(d: dict) -> None:
     tickers = [t.strip().upper() for t in (d.get("ticker") or "").split(",") if t.strip()]
     log.event("ws_delisting", listing_type=listing_type, ticker=d.get("ticker"),
               title=d.get("title"), tickers=tickers, transport_age_sec=age)
-    await tg.send_message(
+    # Сповіщення про сигнал — у фоні, щоб НЕ затримувати відкриття угоди.
+    executor.fire(tg.send_message(
         f"⚡ <b>WS-сигнал: {listing_type}</b>\n"
         f"Токени: {', '.join(tickers) or '—'}\n"
         f"<i>{d.get('title', '')}</i>"
-    )
+    ))
     # Торгуємо лише повний спот-делістинг (як і раніше).
     if listing_type != "spot_delisting":
         return

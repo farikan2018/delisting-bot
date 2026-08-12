@@ -15,6 +15,23 @@ import telegram_client as tg
 
 _MODE = "dry" if config.DRY_RUN else "real"
 
+# Фонові задачі (Telegram-сповіщення) — щоб НЕ блокувати гарячий шлях відкриття.
+_bg_tasks: set = set()
+
+
+async def _safe(coro) -> None:
+    try:
+        await coro
+    except Exception:  # noqa: BLE001
+        log.exception("фонова задача впала")
+
+
+def fire(coro) -> None:
+    """Запустити корутину у фоні (не чекаючи) — для сповіщень/логів поза гарячим шляхом."""
+    t = asyncio.create_task(_safe(coro))
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+
 _REASON_LABEL = {
     "STOP_LOSS": "🛑 Стоп-лос",
     "TAKE_PROFIT": "📉 Тейк-профіт",
@@ -25,56 +42,62 @@ _REASON_LABEL = {
 
 # ---------- ВІДКРИТТЯ ----------
 async def open_from_signal(ticker: str, detect_latency=None) -> None:
-    """Обробляє один тикер делістингу: перевірки → вхід → повідомлення."""
+    """Обробляє один тикер делістингу. ГАРЯЧИЙ ШЛЯХ оптимізовано:
+    підготовка (ціна+ref+плече) — паралельно; ордер — якнайраніше;
+    Telegram-сповіщення — у фоні (fire), не блокують відкриття."""
     venue, symbol = await asyncio.to_thread(exchange.resolve, ticker)
     log.event("resolve", ticker=ticker, venue=venue, symbol=symbol)
     if not symbol:
         vs = "/".join(config.VENUE_PRIORITY)
         log.event("skip", ticker=ticker, reason="no_perp", venues=vs)
-        await tg.send_message(f"ℹ️ <b>{ticker}</b>: нема перпа на {vs} — пропуск.")
+        fire(tg.send_message(f"ℹ️ <b>{ticker}</b>: нема перпа на {vs} — пропуск."))
         return
 
     if storage.has_open_position(symbol):
         log.event("skip", ticker=ticker, reason="already_open")
-        await tg.send_message(f"ℹ️ <b>{ticker}</b>: позиція вже відкрита — пропуск.")
+        fire(tg.send_message(f"ℹ️ <b>{ticker}</b>: позиція вже відкрита — пропуск."))
         return
     if storage.open_positions_count() >= config.MAX_CONCURRENT:
         log.event("skip", ticker=ticker, reason="max_concurrent", limit=config.MAX_CONCURRENT)
-        await tg.send_message(
+        fire(tg.send_message(
             f"⚠️ <b>{ticker}</b>: досягнуто ліміту одночасних позицій "
-            f"({config.MAX_CONCURRENT}) — пропуск."
-        )
+            f"({config.MAX_CONCURRENT}) — пропуск."))
         return
 
-    decision = await asyncio.to_thread(strategy.evaluate_entry, venue, symbol)
+    # --- ПАРАЛЕЛЬНА підготовка: ціна + ref + (у реалі) виставлення плеча — один раунд ---
+    prep = [
+        asyncio.to_thread(exchange.get_last_price, venue, symbol),
+        asyncio.to_thread(exchange.reference_high, venue, symbol, config.REF_LOOKBACK_MIN),
+    ]
+    if not config.DRY_RUN:
+        prep.append(asyncio.to_thread(exchange.set_leverage_safe, venue, symbol, config.LEVERAGE))
+    prep_res = await asyncio.gather(*prep)
+    entry_price, ref_price = prep_res[0], prep_res[1]
+
+    decision = strategy.decide_entry(ref_price, entry_price)
     log.event("entry_eval", ticker=ticker, venue=venue, symbol=symbol, ok=decision.ok,
               reason=decision.reason, ref_price=decision.ref_price,
               entry_price=decision.entry_price, dropped_pct=decision.dropped_pct,
               detect_latency_sec=detect_latency)
     if not decision.ok:
         log.event("skip", ticker=ticker, reason=f"entry:{decision.reason}")
-        await tg.send_message(
-            f"⏭️ <b>{ticker}</b> ({venue}): не входимо — {decision.reason}."
-        )
+        fire(tg.send_message(f"⏭️ <b>{ticker}</b> ({venue}): не входимо — {decision.reason}."))
         return
 
     entry_price = decision.entry_price
     notional = config.POSITION_MARGIN_USDT * config.LEVERAGE
-    contracts = await asyncio.to_thread(
-        exchange.contracts_for, venue, symbol, notional, entry_price
-    )
-    contract_size = (await asyncio.to_thread(exchange.market_meta, venue, symbol))["contract_size"]
+    # Розмір позиції — з уже завантажених markets (в памʼяті, без мережі).
+    contracts = exchange.contracts_for(venue, symbol, notional, entry_price)
+    contract_size = exchange.market_meta(venue, symbol)["contract_size"]
 
-    # Реальне відкриття (тільки не в dry-run)
+    # --- ОРДЕР якнайраніше (плече вже виставлено паралельно вище) ---
     if not config.DRY_RUN:
         try:
-            order = await asyncio.to_thread(
-                exchange.open_short, venue, symbol, contracts, config.LEVERAGE
-            )
+            order = await asyncio.to_thread(exchange.open_short, venue, symbol, contracts)
             entry_price = order.get("average") or order.get("price") or entry_price
         except Exception:  # noqa: BLE001
             log.exception(f"open_short помилка {ticker} {venue}")
-            await tg.send_message(f"❌ <b>{ticker}</b>: помилка відкриття ордера ({venue}).")
+            fire(tg.send_message(f"❌ <b>{ticker}</b>: помилка відкриття ордера ({venue})."))
             return
 
     pos = {
@@ -89,7 +112,7 @@ async def open_from_signal(ticker: str, detect_latency=None) -> None:
               mode=_MODE, entry_price=entry_price, contracts=contracts,
               margin=pos["margin"], leverage=pos["leverage"],
               dropped_pct=decision.dropped_pct, detect_latency_sec=detect_latency)
-    await tg.send_message(_open_message(pos_id, pos))
+    fire(tg.send_message(_open_message(pos_id, pos)))  # сповіщення — у фоні
 
 
 def _open_message(pos_id: int, p: dict) -> str:

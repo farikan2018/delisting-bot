@@ -18,18 +18,13 @@ class EntryDecision:
     dropped_pct: float | None  # на скільки вже впала від ref до входу
 
 
-def evaluate_entry(venue: str, symbol: str) -> EntryDecision:
-    """Strategy v2: входимо на детекті (ловимо continuation після обвалу анонсу).
-    Backward-фільтр вимкнено (MAX_ALREADY_DROP_PCT=0), бо він ріже все —
-    головний дамп стається до появи анонсу в API. dropped_pct рахуємо для інфо."""
-    entry_price = exchange.get_last_price(venue, symbol)
+def decide_entry(ref_price: float | None, entry_price: float | None) -> EntryDecision:
+    """ЧИСТЕ рішення входу (без I/O) — ціну й ref фетчимо ЗОВНІ (паралельно в executor).
+    Дає змогу не робити мережеві виклики послідовно на гарячому шляху."""
     if not entry_price:
-        return EntryDecision(False, "нема даних ціни", None, entry_price, None)
-
-    ref_price = exchange.reference_high(venue, symbol, config.REF_LOOKBACK_MIN)
+        return EntryDecision(False, "нема даних ціни", ref_price, entry_price, None)
     dropped_pct = ((ref_price - entry_price) / ref_price * 100.0) if ref_price else 0.0
-
-    # Фільтр лишаємо опційним: якщо MAX_ALREADY_DROP_PCT>0 і вже впало більше — пропуск.
+    # Anti-late-entry: якщо вже впало більше за поріг — пропуск (0 = фільтр вимкнено).
     if config.MAX_ALREADY_DROP_PCT > 0 and dropped_pct > config.MAX_ALREADY_DROP_PCT:
         return EntryDecision(
             False,
@@ -37,6 +32,14 @@ def evaluate_entry(venue: str, symbol: str) -> EntryDecision:
             ref_price, entry_price, dropped_pct,
         )
     return EntryDecision(True, "OK", ref_price, entry_price, dropped_pct)
+
+
+def evaluate_entry(venue: str, symbol: str) -> EntryDecision:
+    """I/O-обгортка (для тестів/сумісності): фетчить ціну+ref послідовно, тоді decide_entry.
+    Гарячий шлях у executor фетчить ці два ЗНАЧЕННЯ паралельно й кличе decide_entry напряму."""
+    entry_price = exchange.get_last_price(venue, symbol)
+    ref_price = exchange.reference_high(venue, symbol, config.REF_LOOKBACK_MIN) if entry_price else None
+    return decide_entry(ref_price, entry_price)
 
 
 def margin_profit_pct(entry: float, price: float, leverage: float) -> float:
