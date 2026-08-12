@@ -65,6 +65,12 @@ EXIT_CHECK_SEC = float(_ENV.get("EXIT_CHECK_SEC", "5") or "5")                  
 # а не ~566мс (холодний старт). 0 = вимкнути. Замір показав різницю ~400мс.
 KEEPALIVE_SEC = float(_ENV.get("KEEPALIVE_SEC", "30") or "30")
 
+# Price-cache: фоновий знімок цін усіх Bybit-перпів (1 HTTP/усі символи) раз на
+# PRICECACHE_POLL_SEC — щоб на сигналі мати ціну+ref У ПАМʼЯТІ (без мережі на гарячому
+# шляху). Якщо ціна старіша за MAX_AGE — не довіряємо, фолбек на REST. 0 = вимкнути кеш.
+PRICECACHE_POLL_SEC = float(_ENV.get("PRICECACHE_POLL_SEC", "2") or "2")
+PRICECACHE_MAX_AGE_SEC = float(_ENV.get("PRICECACHE_MAX_AGE_SEC", "10") or "10")
+
 # Risk-ліміти
 MAX_CONCURRENT = int(_ENV.get("MAX_CONCURRENT", "3") or "3")             # макс. одночасних позицій
 # Свіжість сигналу: угоду відкриваємо лише якщо від публікації минуло <= стільки секунд.

@@ -9,6 +9,7 @@ import datetime as dt
 import config
 import exchange
 import logbook as log
+import pricecache
 import storage
 import strategy
 import telegram_client as tg
@@ -64,15 +65,27 @@ async def open_from_signal(ticker: str, detect_latency=None) -> None:
             f"({config.MAX_CONCURRENT}) — пропуск."))
         return
 
-    # --- ПАРАЛЕЛЬНА підготовка: ціна + ref + (у реалі) виставлення плеча — один раунд ---
-    prep = [
-        asyncio.to_thread(exchange.get_last_price, venue, symbol),
-        asyncio.to_thread(exchange.reference_high, venue, symbol, config.REF_LOOKBACK_MIN),
-    ]
+    # --- Ціна + ref: СПЕРШУ з кешу (в памʼяті, 0 мережі), інакше фолбек на REST ---
+    entry_price = ref_price = None
+    src = "rest"
+    if config.PRICECACHE_POLL_SEC > 0 and venue == "bybit":
+        raw = exchange.raw_symbol_id(venue, symbol)
+        gp = pricecache.get_price(raw) if raw else None
+        if gp and gp[1] <= config.PRICECACHE_MAX_AGE_SEC:
+            entry_price, src = gp[0], f"cache({gp[1]:.1f}s)"
+            ref_price = pricecache.reference_high(raw, config.REF_LOOKBACK_MIN)
+
+    # Мережеві задачі: фетч ціни+ref лише якщо кеш-промах; плече — лише в реалі.
+    prep = []
+    if entry_price is None:
+        prep.append(asyncio.to_thread(exchange.get_last_price, venue, symbol))
+        prep.append(asyncio.to_thread(exchange.reference_high, venue, symbol, config.REF_LOOKBACK_MIN))
     if not config.DRY_RUN:
         prep.append(asyncio.to_thread(exchange.set_leverage_safe, venue, symbol, config.LEVERAGE))
-    prep_res = await asyncio.gather(*prep)
-    entry_price, ref_price = prep_res[0], prep_res[1]
+    prep_res = await asyncio.gather(*prep) if prep else []
+    if entry_price is None:
+        entry_price, ref_price = prep_res[0], prep_res[1]
+    log.event("price_src", ticker=ticker, source=src, entry_price=entry_price, ref_price=ref_price)
 
     decision = strategy.decide_entry(ref_price, entry_price)
     log.event("entry_eval", ticker=ticker, venue=venue, symbol=symbol, ok=decision.ok,

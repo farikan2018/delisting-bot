@@ -63,6 +63,14 @@ def resolve(ticker: str) -> tuple[str | None, str | None]:
     return None, None
 
 
+def raw_symbol_id(venue: str, symbol: str) -> str | None:
+    """Сирий біржовий ID символу (напр. 'DOGEUSDT') з уже завантажених markets — без мережі."""
+    try:
+        return client(venue).market(symbol).get("id")
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def get_last_price(venue: str, symbol: str) -> float | None:
     return client(venue).fetch_ticker(symbol).get("last")
 

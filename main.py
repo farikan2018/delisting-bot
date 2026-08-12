@@ -24,6 +24,7 @@ import config
 import exchange
 import executor
 import logbook as log
+import pricecache
 import storage
 import telegram_client as tg
 
@@ -209,8 +210,9 @@ async def main() -> None:
     else:
         print("[!] TELEGRAM_CHAT_ID не заданий — сповіщення підуть у консоль. "
               "Запусти get_chat_id.py, щоб його дізнатися.")
-    # WS-тригер (основний), поллінг-сторож, monitor і keep-alive — паралельно
-    await asyncio.gather(_ws_loop(), _watch_loop(), _monitor_loop(), _keepalive_loop())
+    # WS-тригер (основний), поллінг-сторож, monitor, keep-alive і price-cache — паралельно
+    await asyncio.gather(_ws_loop(), _watch_loop(), _monitor_loop(),
+                         _keepalive_loop(), pricecache.run())
 
 
 if __name__ == "__main__":
