@@ -6,9 +6,14 @@ logs/probe.jsonl: яке джерело, коли побачило, releaseDate 
 WebSocket-фідом, коли буде тест-ключ).
 """
 import asyncio
+import base64
 import datetime as dt
 import json
+import os
+import tempfile
 import time
+import urllib.request
+import uuid
 from pathlib import Path
 
 import aiohttp
@@ -168,10 +173,84 @@ async def watch_telegram():
         await asyncio.sleep(5)
 
 
+# --- Odin: нативний real-time push Binance (NATS-over-WS) ---
+_ODIN_REG = "https://www.binance.com/bapi/fe/message/immed/web/register"
+
+
+def _odin_register() -> dict:
+    """Анонімна headless-реєстрація у push-сервісі Binance. Повертає addrs+appId+creds."""
+    u = str(uuid.uuid4())
+    req = urllib.request.Request(_ODIN_REG, headers={
+        "User-Agent": "Mozilla/5.0", "clienttype": "web",
+        "bnc-uuid": u, "cookie": f"bnc-uuid={u}"})
+    d = json.loads(urllib.request.urlopen(req, timeout=15).read())
+    return d.get("data") or {}
+
+
+def _jwt_subjects(creds: str) -> list:
+    jwt = creds.split("BEGIN NATS USER JWT-----")[1].split("-----")[0].strip()
+    payload = json.loads(base64.urlsafe_b64decode(jwt.split(".")[1] + "=="))
+    return payload.get("nats", {}).get("sub", {}).get("allow", [])
+
+
+async def watch_odin():
+    """Слухає нативний push-канал Binance (Odin/NATS). Логує КОЖНЕ повідомлення —
+    щоб на живому делістингу побачити, чи він приходить сюди й наскільки швидше за
+    apex/cryptolisting. Creds живуть 5хв → пере-реєстрація+реконект кожні ~4хв."""
+    try:
+        import nats
+    except Exception as e:  # noqa: BLE001
+        print("odin: nats-py не встановлено:", e, flush=True)
+        return
+    while True:
+        credfile = None
+        nc = None
+        try:
+            data = await asyncio.to_thread(_odin_register)
+            if not data.get("creds"):
+                print("odin: реєстрація не вдалась", flush=True)
+                await asyncio.sleep(10)
+                continue
+            subs = _jwt_subjects(data["creds"])
+            f = tempfile.NamedTemporaryFile("w", suffix=".creds", delete=False)
+            f.write(data["creds"]); f.close()
+            credfile = f.name
+            nc = await nats.connect(servers=data["addrs"], user_credentials=credfile,
+                                    connect_timeout=10, max_reconnect_attempts=3)
+            print(f"odin: підключено -> {nc.connected_url.netloc if nc.connected_url else '?'}, "
+                  f"subjects={len(subs)}", flush=True)
+
+            async def handler(msg):  # noqa: ANN001
+                now_ms = int(time.time() * 1000)
+                try:
+                    body = msg.data.decode("utf-8", "replace")
+                except Exception:  # noqa: BLE001
+                    body = str(msg.data)
+                _log({"ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+                      "source": "odin_push", "subject": msg.subject,
+                      "title": body[:300], "detected_ms": now_ms,
+                      "release_ms": None, "latency_sec": None})
+
+            for s in subs:
+                await nc.subscribe(s, cb=handler)
+            await asyncio.sleep(250)  # тримаємо ~4хв, поки creds свіжі
+        except Exception as e:  # noqa: BLE001
+            print("odin: помилка", type(e).__name__, str(e)[:120], flush=True)
+            await asyncio.sleep(5)
+        finally:
+            try:
+                if nc:
+                    await nc.close()
+            except Exception:  # noqa: BLE001
+                pass
+            if credfile and os.path.exists(credfile):
+                os.unlink(credfile)
+
+
 async def main():
-    print("probe: стежу за", [s["name"] for s in SOURCES], "+ ws + tg", flush=True)
+    print("probe: стежу за", [s["name"] for s in SOURCES], "+ ws + tg + odin", flush=True)
     async with aiohttp.ClientSession() as s:
-        await asyncio.gather(watch_ws(), watch_telegram(),
+        await asyncio.gather(watch_ws(), watch_telegram(), watch_odin(),
                              *[watch(s, src) for src in SOURCES])
 
 
