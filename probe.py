@@ -27,7 +27,7 @@ SOURCES = [
     {"name": "cms_composite", "poll": 5.0,
      "url": "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
             "?type=1&catalogId=161&pageNo=1&pageSize=20"},
-    {"name": "apex_fast", "poll": 1.0,
+    {"name": "apex_fast", "poll": 0.5,
      "url": "https://www.binance.com/bapi/apex/v1/public/apex/cms/article/list/query"
             "?type=1&catalogId=161&pageNo=1&pageSize=20"},
 ]
