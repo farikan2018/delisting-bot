@@ -42,6 +42,15 @@ def init() -> None:
                 closed_at     TEXT
             )"""
         )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS armed_leverage (
+                venue    TEXT,
+                symbol   TEXT,
+                leverage REAL,
+                armed_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (venue, symbol)
+            )"""
+        )
         # міграція: додати venue, якщо БД створювалась до мульти-біржі
         cols = [r[1] for r in db.execute("PRAGMA table_info(positions)").fetchall()]
         if "venue" not in cols:
@@ -69,6 +78,27 @@ def mark_seen(article_id: str, title: str) -> None:
 def seen_count() -> int:
     with _conn() as db:
         return db.execute("SELECT COUNT(*) FROM seen_articles").fetchone()[0]
+
+
+# ---- armed_leverage (плече, виставлене заздалегідь) ----
+# Bybit тримає плече на своїй стороні назавжди, тому виставити його достатньо ОДИН раз.
+# Записуємо в БД, щоб рестарт бота не бив API 800 разів заново.
+def armed_symbols(venue: str, leverage: float) -> set[str]:
+    with _conn() as db:
+        rows = db.execute(
+            "SELECT symbol FROM armed_leverage WHERE venue = ? AND leverage = ?",
+            (venue, leverage),
+        ).fetchall()
+        return {r[0] for r in rows}
+
+
+def mark_armed(venue: str, symbol: str, leverage: float) -> None:
+    with _conn() as db:
+        db.execute(
+            "INSERT OR REPLACE INTO armed_leverage (venue, symbol, leverage) VALUES (?,?,?)",
+            (venue, symbol, leverage),
+        )
+        db.commit()
 
 
 # ---- positions ----
@@ -108,6 +138,17 @@ def get_open_positions() -> list[dict]:
         db.row_factory = sqlite3.Row
         rows = db.execute("SELECT * FROM positions WHERE status = 'open'").fetchall()
         return [dict(r) for r in rows]
+
+
+def update_entry_price(pos_id: int, entry_price: float) -> None:
+    """Виправляє ціну входу на РЕАЛЬНУ ціну виконання (довантажується після ордера,
+    щоб не тримати гарячий шлях). min_price підтягуємо, якщо fill був нижчий."""
+    with _conn() as db:
+        db.execute(
+            "UPDATE positions SET entry_price = ?, min_price = MIN(min_price, ?) WHERE id = ?",
+            (entry_price, entry_price, pos_id),
+        )
+        db.commit()
 
 
 def update_min_price(pos_id: int, min_price: float) -> None:

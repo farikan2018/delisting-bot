@@ -10,6 +10,7 @@ import asyncio
 import sys
 
 import config
+import exchange
 import executor
 import storage
 
@@ -18,6 +19,11 @@ async def main() -> None:
     storage.init()
     args = sys.argv[1:]
     cmd = args[0] if args else "list"
+    if cmd in ("open", "close"):
+        # Гарячий шлях читає пре-обчислену мету символів — в окремому процесі її треба
+        # побудувати самому (у бота це робить main.py на старті).
+        await asyncio.to_thread(exchange.prearm_symbols)
+        executor.resync_open()
 
     if cmd == "open":
         if len(args) < 2:

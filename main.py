@@ -6,7 +6,6 @@
 """
 import asyncio
 import datetime as dt
-import json
 import sys
 import time
 
@@ -23,11 +22,15 @@ import binance_watcher as bw
 import config
 import exchange
 import executor
+import fastjson
 import logbook as log
 import pricecache
+import runtime
 import storage
 import telegram_client as tg
 
+
+_LOOP = "asyncio"  # перезаписується в __main__ на "uvloop", якщо він доступний
 
 _CAT_LABEL = {
     bw.SPOT_DELIST: "🔴 ПОВНИЙ ДЕЛІСТИНГ ТОКЕНА (сигнал для шорта)",
@@ -48,6 +51,18 @@ def _fmt_event(ev: bw.DelistingEvent) -> str:
         lines.append(f'<a href="{ev.url}">Анонс</a>')
     lines.append("<i>(Фаза 1: сповіщення, без ордерів)</i>")
     return "\n".join(lines)
+
+
+async def _fire_tickers(tickers: list[str], latency, source: str) -> None:
+    """Усі токени з одного анонсу — ПАРАЛЕЛЬНО. Послідовно другий токен чекав би,
+    поки перший відпрацює свій ордер (165мс до матчера Bybit), третій — двічі стільки:
+    на типовому анонсі з трьох токенів останній заходив на пів секунди пізніше."""
+    async def one(tk: str) -> None:
+        try:
+            await executor.open_from_signal(tk, detect_latency=latency, source=source)
+        except Exception:  # noqa: BLE001
+            log.exception(f"executor помилка по {tk}")
+    await asyncio.gather(*(one(tk) for tk in tickers))
 
 
 async def _watch_loop() -> None:
@@ -81,11 +96,7 @@ async def _watch_loop() -> None:
                     if ev.actionable and ev.tickers:
                         fresh = latency is not None and latency <= config.MAX_SIGNAL_AGE_SEC
                         if fresh:
-                            for ticker in ev.tickers:
-                                try:
-                                    await executor.open_from_signal(ticker, detect_latency=latency)
-                                except Exception:  # noqa: BLE001
-                                    log.exception(f"executor помилка по {ticker}")
+                            await _fire_tickers(ev.tickers, latency, "poll_apex")
                         else:
                             log.event("poll_stale_no_trade", tickers=ev.tickers,
                                       latency_sec=latency)
@@ -121,11 +132,7 @@ async def _handle_ws_delisting(d: dict) -> None:
     # Торгуємо лише повний спот-делістинг (як і раніше).
     if listing_type != "spot_delisting":
         return
-    for tk in tickers:
-        try:
-            await executor.open_from_signal(tk, detect_latency=age)
-        except Exception:  # noqa: BLE001
-            log.exception(f"WS executor помилка по {tk}")
+    await _fire_tickers(tickers, age, "ws_cryptolisting")
 
 
 async def _ws_loop() -> None:
@@ -146,7 +153,7 @@ async def _ws_loop() -> None:
                                 break
                             continue
                         try:
-                            d = json.loads(msg.data)
+                            d = fastjson.loads(msg.data)
                         except Exception:  # noqa: BLE001
                             continue
                         if d.get("type") == "announcement" and \
@@ -178,6 +185,41 @@ async def _keepalive_loop() -> None:
                 log.exception(f"keepalive помилка {v}")
 
 
+async def _arm_leverage_loop() -> None:
+    """Озброює плече по ВСІХ символах заздалегідь. Перший ордер по «новому» символу
+    інакше платить +165мс за set_leverage — а делістинг це завжди новий символ.
+    Bybit тримає плече у себе назавжди, тому робимо це один раз і пишемо в БД, щоб
+    рестарт не бив API 800 разів. Раз на ARM_REFRESH_SEC — щоб озброїти нові листинги."""
+    if not config.ARM_LEVERAGE or not config.BYBIT_API_KEY:
+        log.info("arm: пре-озброєння плеча вимкнено (нема ключів або ARM_LEVERAGE=0)")
+        return
+    await asyncio.sleep(5)  # даємо старту вгамуватися
+    while True:
+        try:
+            done = await asyncio.to_thread(storage.armed_symbols, "bybit", config.LEVERAGE)
+            for s in done:
+                exchange.mark_leveraged("bybit", s)
+            todo = sorted({m["symbol"] for m in exchange.HOT.values()
+                           if m["venue"] == "bybit"} - done)
+            if todo:
+                log.event("arm_start", leverage=config.LEVERAGE, armed=len(done), todo=len(todo))
+                ok = 0
+                for i, sym in enumerate(todo, 1):
+                    while executor.busy():  # сигнал у роботі — не забиваємо конект
+                        await asyncio.sleep(0.2)
+                    if await asyncio.to_thread(exchange.ensure_leverage, "bybit", sym,
+                                               config.LEVERAGE):
+                        await asyncio.to_thread(storage.mark_armed, "bybit", sym, config.LEVERAGE)
+                        ok += 1
+                    if i % 200 == 0:
+                        log.event("arm_progress", done=i, total=len(todo), ok=ok)
+                    await asyncio.sleep(config.ARM_SLEEP_SEC)
+                log.event("arm_done", armed_ok=ok, total=len(todo))
+        except Exception:  # noqa: BLE001
+            log.exception("arm помилка")
+        await asyncio.sleep(config.ARM_REFRESH_SEC)
+
+
 _HELP = (
     "🎛 <b>Команди</b>\n"
     "/status — стан бота\n"
@@ -199,14 +241,17 @@ async def _handle_command(text: str) -> None:
 
     elif cmd == "status":
         pcs = pricecache.stats()
-        open_n = storage.open_positions_count()
+        hs = executor.hot_state()
+        armed = len(await asyncio.to_thread(storage.armed_symbols, "bybit", config.LEVERAGE))
         mode = "🧪 DRY (авто)" if config.DRY_RUN else "⚠️ РЕАЛ (авто)"
         await tg.send_message(
             "📊 <b>Стан</b>\n"
             f"Авто-режим: {mode}\n"
             f"Тригер: {'⚡ WS' if config.CL_WS_KEY else '🐌 поллінг'}\n"
             f"Price-cache: {pcs['symbols']} симв., WS-оновлень {pcs['ws_msgs']}\n"
-            f"Відкритих позицій: {open_n}\n"
+            f"Гарячих символів: {len(exchange.HOT)} | плече озброєно: {armed}\n"
+            f"Луп: {_LOOP} | json: {fastjson.NAME}\n"
+            f"Відкритих позицій: {hs['open']} (у роботі {hs['reserved']})\n"
             f"Тест-маржа: ${config.TEST_MARGIN_USDT:g} × {config.LEVERAGE:g}x"
         )
 
@@ -225,7 +270,8 @@ async def _handle_command(text: str) -> None:
             f"⏳ Відкриваю <b>РЕАЛЬНИЙ</b> тест-шорт <b>{sym}</b> "
             f"на ${config.TEST_MARGIN_USDT:g} × {config.LEVERAGE:g}x…"
         )
-        await executor.open_from_signal(sym, real=True, margin=config.TEST_MARGIN_USDT)
+        await executor.open_from_signal(sym, real=True, margin=config.TEST_MARGIN_USDT,
+                                       dedup=False, source="test_short")
 
     elif cmd == "close":
         if len(parts) < 2 or not parts[1].isdigit():
@@ -289,6 +335,13 @@ async def _monitor_loop() -> None:
 
 async def main() -> None:
     storage.init()
+    executor.resync_open()  # люстро відкритих позицій у памʼять (дедуп на гарячому шляху)
+    # Пре-обчислення всього, що потрібно для входу: venue+symbol+raw_id+contract_size по
+    # кожному тикеру. Це тягне ccxt-markets (~4с) — свідомо на СТАРТІ, а не на сигналі.
+    st = await asyncio.to_thread(exchange.prearm_symbols)
+    log.event("prearm_symbols", **st)
+    gcinfo = runtime.tune_gc()
+    log.event("runtime", loop=_LOOP, json=fastjson.NAME, **gcinfo)
     log.event("startup", dry_run=config.DRY_RUN, venues=config.VENUE_PRIORITY,
               margin=config.POSITION_MARGIN_USDT, leverage=config.LEVERAGE,
               tp=config.TAKE_PROFIT_MARGIN_PCT, sl=config.STOP_LOSS_MARGIN_PCT,
@@ -309,13 +362,16 @@ async def main() -> None:
     else:
         print("[!] TELEGRAM_CHAT_ID не заданий — сповіщення підуть у консоль. "
               "Запусти get_chat_id.py, щоб його дізнатися.")
-    # WS-тригер, поллінг-сторож, monitor, keep-alive, price-cache, Telegram-команди — паралельно
+    # WS-тригер, поллінг-сторож, monitor, keep-alive, price-cache, Telegram-команди,
+    # пре-озброєння плеча і монітор лагу лупу — паралельно.
     await asyncio.gather(_ws_loop(), _watch_loop(), _monitor_loop(),
                          _keepalive_loop(), pricecache.run(), pricecache.ws_run(),
-                         _command_loop())
+                         _command_loop(), _arm_leverage_loop(),
+                         runtime.loop_lag_monitor())
 
 
 if __name__ == "__main__":
+    _LOOP = runtime.install_loop()  # uvloop, якщо є — ДО створення лупу
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

@@ -62,7 +62,15 @@ MAX_ALREADY_DROP_PCT = float(_ENV.get("MAX_ALREADY_DROP_PCT", "8") or "8")
 STOP_LOSS_MARGIN_PCT = float(_ENV.get("STOP_LOSS_MARGIN_PCT", "30") or "30")        # збиток -30% маржі → стоп
 TAKE_PROFIT_MARGIN_PCT = float(_ENV.get("TAKE_PROFIT_MARGIN_PCT", "30") or "30")    # прибуток +30% маржі → тейк
 MAX_HOLD_MINUTES = float(_ENV.get("MAX_HOLD_MINUTES", "45") or "45")                # примусове закриття
-EXIT_CHECK_SEC = float(_ENV.get("EXIT_CHECK_SEC", "5") or "5")                      # частота перевірки позицій
+# Перевірка виходу тепер читає ціну з price-cache (0 мережі), тому частіше = безкоштовно.
+EXIT_CHECK_SEC = float(_ENV.get("EXIT_CHECK_SEC", "2") or "2")                      # частота перевірки позицій
+
+# Пре-озброєння плеча: виставити LEVERAGE по всіх символах ЗАЗДАЛЕГІДЬ, щоб бойовий
+# ордер не платив +165мс за set_leverage (делістинг — це завжди «новий» символ).
+# Робиться один раз (стан у БД), потім лише для нових листингів раз на ARM_REFRESH_SEC.
+ARM_LEVERAGE = (_ENV.get("ARM_LEVERAGE", "1").strip() != "0")
+ARM_SLEEP_SEC = float(_ENV.get("ARM_SLEEP_SEC", "0.15") or "0.15")   # пауза між викликами (rate-limit)
+ARM_REFRESH_SEC = float(_ENV.get("ARM_REFRESH_SEC", "21600") or "21600")  # 6г: догнати нові символи
 
 # Keep-alive: пінг бірж, щоб TLS-конект був теплим і бойовий ордер летів ~165мс,
 # а не ~566мс (холодний старт). 0 = вимкнути. Замір показав різницю ~400мс.

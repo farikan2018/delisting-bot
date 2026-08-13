@@ -9,12 +9,12 @@
 запиту на гарячому шляху відкриття. Ключ — сирий bybit-символ (напр. "DOGEUSDT").
 """
 import asyncio
-import json
 import time
 
 import aiohttp
 
 import config
+import fastjson
 import logbook as log
 
 _SNAP_URL = "https://api.bybit.com/v5/market/tickers?category=linear"
@@ -99,7 +99,7 @@ async def ws_run() -> None:
                                 break
                             continue
                         try:
-                            d = json.loads(msg.data)
+                            d = fastjson.loads(msg.data)
                         except Exception:  # noqa: BLE001
                             continue
                         topic = d.get("topic", "")
@@ -131,7 +131,9 @@ async def run() -> None:
                 async with s.get(_SNAP_URL, headers=_HEADERS,
                                  timeout=aiohttp.ClientTimeout(total=10)) as r:
                     if r.status == 200:
-                        data = await r.json()
+                        # ~200КБ на 800+ символів раз на 2с — парсимо orjson-ом, щоб не
+                        # тримати луп і не сипати обʼєктами під ноги збирачу.
+                        data = fastjson.loads(await r.read())
                         now_ms = _now_ms()
                         for t in ((data.get("result") or {}).get("list") or []):
                             try:
