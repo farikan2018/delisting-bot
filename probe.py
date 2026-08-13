@@ -18,16 +18,16 @@ import config
 _LOGDIR = Path(__file__).parent / "logs"
 _LOGDIR.mkdir(exist_ok=True)
 _OUT = _LOGDIR / "probe.jsonl"
-POLL = 5.0  # гентельно, щоб не 429-ити composite (яким користується сам бот)
+POLL = 5.0  # дефолтний інтервал
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json", "lang": "en"}
 
-# Джерела для порівняння. composite (як у бота) vs apex (окремий, стійкіший сервіс).
-# WebSocket-фід додамо сюди, коли буде тест-ключ.
+# Джерела для порівняння. Мета Кроку 1: чи наш ШВИДКИЙ self-poll apex зрівняється/
+# обіжене cryptolisting-WS. composite тримаємо повільним (він 429-ить), apex — швидко.
 SOURCES = [
-    {"name": "cms_delisting",
+    {"name": "cms_composite", "poll": 5.0,
      "url": "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
             "?type=1&catalogId=161&pageNo=1&pageSize=20"},
-    {"name": "apex_delisting",
+    {"name": "apex_fast", "poll": 1.0,
      "url": "https://www.binance.com/bapi/apex/v1/public/apex/cms/article/list/query"
             "?type=1&catalogId=161&pageNo=1&pageSize=20"},
 ]
@@ -57,6 +57,8 @@ def _log(rec):
 
 async def watch(session, src):
     seen, primed = set(), False
+    poll = src.get("poll", POLL)
+    n429, last429log = 0, time.time()
     while True:
         try:
             async with session.get(src["url"], headers=HEADERS,
@@ -74,9 +76,15 @@ async def watch(session, src):
                               "source": src["name"], "article_id": aid, "title": title,
                               "release_ms": rel, "detected_ms": now_ms, "latency_sec": lat})
                     primed = True
+                elif r.status == 429:
+                    n429 += 1  # стежимо за rate-limit при швидкому полінгу
         except Exception:  # noqa: BLE001
             pass
-        await asyncio.sleep(POLL)
+        now = time.time()
+        if now - last429log > 300:  # heartbeat раз на 5хв: скільки 429 і поточний темп
+            print(f"{src['name']}: poll={poll}s 429/5хв={n429}", flush=True)
+            n429, last429log = 0, now
+        await asyncio.sleep(poll)
 
 
 async def watch_ws():
