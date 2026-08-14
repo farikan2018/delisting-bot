@@ -1,2 +1,8 @@
 aiohttp>=3.9
 ccxt>=4.4
+# Прискорення гарячого шляху. Формально опційні — fastjson.py і runtime.py мають
+# фолбек на stdlib, — але на сервері мусять бути, інакше бот тихо працює на
+# повільнішому лупі asyncio і json зі stdlib замість uvloop+orjson.
+orjson>=3.9
+# uvloop не збирається під Windows, а локальна розробка саме там — тому маркер.
+uvloop>=0.19; sys_platform != "win32"

@@ -37,6 +37,11 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=$APP_DIR/.venv/bin/python $APP_DIR/main.py
 Restart=always
 RestartSec=5
+# Бот — головний процес на машині: ордер не має чекати, поки планувальник віддасть
+# CPU чомусь іншому. Замір на 2 vCPU показав сплески лагу event-loop до ~50мс, коли
+# поруч працювала проба; Nice/CPUWeight це прибрали.
+Nice=-5
+CPUWeight=1000
 
 [Install]
 WantedBy=multi-user.target
