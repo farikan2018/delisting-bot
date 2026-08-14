@@ -111,10 +111,27 @@ MAX_CONCURRENT = int(_ENV.get("MAX_CONCURRENT", "3") or "3")             # ма�
 # WS-фід дає ~3-4с → торгує. Поллінг ~126с → лише попереджає, не торгує.
 MAX_SIGNAL_AGE_SEC = float(_ENV.get("MAX_SIGNAL_AGE_SEC", "60") or "60")
 
+# --- Власний швидкий детектор анонсів (fastcms) ---
+# www.binance.com віддає CMS через CloudFront із TTL ~120с (виміряно по Age), тому
+# поллінг там бачить анонс із запізненням до 2хв. Ті самі дані на accounts/p2p/
+# launchpad.binance.com віддаються БЕЗ кешу (X-Cache: Miss завжди), RTT ~260мс з
+# Франкфурта. Крутимо хости по колу зі зсувом фази: затримка = POLL/(2·N) + RTT.
+# 0.6с × 3 хости => ефективний інтервал 200мс => детект ~360мс.
+# Rate-limit перевірено до 8 запитів/с з одного IP — усі 200. Тут виходить ~5/с.
+FASTCMS = (_ENV.get("FASTCMS", "1").strip() != "0")
+FASTCMS_POLL_SEC = float(_ENV.get("FASTCMS_POLL_SEC", "0.6") or "0.6")
+FASTCMS_HOSTS = int(_ENV.get("FASTCMS_HOSTS", "3") or "3")
+FASTCMS_TIMEOUT_SEC = float(_ENV.get("FASTCMS_TIMEOUT_SEC", "5") or "5")
+# Торгувати за сигналом fastcms (а не лише сповіщати). Це ТОЙ САМИЙ тип сигналу, що й
+# WS-фід (новина про делістинг), тільки швидший — тому за замовчуванням увімкнено.
+FASTCMS_TRADE = (_ENV.get("FASTCMS_TRADE", "1").strip() != "0")
+
 # Binance Announcements API. catalogId=161 = розділ "Delisting".
 # apex-ендпоінт стійкіший до rate-limit (429), ніж composite; структура ідентична.
+# Хост — некешований (див. вище), тому навіть сторож-поллінг бачить анонси одразу,
+# а не з віком до 120с.
 BINANCE_CMS_URL = (
-    "https://www.binance.com/bapi/apex/v1/public/apex/cms/article/list/query"
+    "https://accounts.binance.com/bapi/apex/v1/public/apex/cms/article/list/query"
     "?type=1&catalogId=161&pageNo=1&pageSize=20"
 )
 

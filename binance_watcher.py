@@ -10,21 +10,46 @@ import aiohttp
 import config
 
 # Слова, які виглядають як тикери, але ними не є — відсіюємо.
+# УВАГА: сюди НЕ можна класти короткі англійські слова, які є й тикерами (THE, ON,
+# FOR, ID, AI…) — бо тоді реальний токен зникає. Тому список тримаємо мінімальним і
+# застосовуємо його лише до сегмента заголовка з перелічними тикерами (див. нижче).
 _STOPWORDS = {
-    "WILL", "AND", "THE", "ON", "FOR", "USDT", "BUSD", "USDC", "FDUSD", "BTC",
-    "ETH", "BNB", "TRY", "EUR", "USD", "NOTICE", "BINANCE", "SPOT", "MARGIN",
-    "FUTURES", "TRADING", "PAIRS", "PAIR", "OF", "TO", "UTC", "CEASE", "REMOVE",
-    "REMOVAL", "DELIST", "DELISTS", "DELISTING", "CONVERT", "EARN", "OR",
+    "USDT", "BUSD", "USDC", "FDUSD", "BTC", "ETH", "BNB", "TRY", "EUR", "USD",
+    "AND", "OR", "ON", "TO", "FROM", "UTC", "AM", "PM",
+}
+# Ці ж слова, але для «широкого» режиму (коли сегмент не вдалось вирізати).
+_STOPWORDS_WIDE = _STOPWORDS | {
+    "WILL", "THE", "FOR", "NOTICE", "BINANCE", "SPOT", "MARGIN", "FUTURES",
+    "TRADING", "PAIRS", "PAIR", "OF", "CEASE", "REMOVE", "REMOVAL", "DELIST",
+    "DELISTS", "DELISTING", "CONVERT", "EARN", "LOAN", "LOANS", "CROSS",
+    "ISOLATED", "PERPETUAL", "CONTRACT", "SUPPORT", "PLAN",
 }
 
 # Заголовки, що реально означають делістинг спот-токена.
 _DELIST_HINT = re.compile(r"\b(delist|removal|remove|will delist)\b", re.IGNORECASE)
 
 # Категорії за силою сигналу для стратегії.
-SPOT_DELIST = "SPOT_DELIST"        # головний сигнал: повний делістинг токена
-FUTURES_DELIST = "FUTURES_DELIST"  # делістинг ф'ючерсного контракту
-PAIR_REMOVAL = "PAIR_REMOVAL"      # прибирання окремих пар (тикери в тілі)
+SPOT_DELIST = "SPOT_DELIST"          # головний сигнал: повний делістинг токена
+MARGIN_DELIST = "MARGIN_DELIST"      # делістинг лише з margin/loan — спот лишається
+FUTURES_DELIST = "FUTURES_DELIST"    # делістинг ф'ючерсного контракту
+PAIR_REMOVAL = "PAIR_REMOVAL"        # прибирання окремих пар (тикери в тілі)
 OTHER = "OTHER"
+
+# «Суб'єктом» делістингу є margin/loan, а не спот: «Binance Margin And Loan Will
+# Delist…», «…Will Delist TUSD from Cross and Isolated Margin». Спот при цьому
+# лишається торгуватись.
+# Бектест на тік-даних Bybit: 48 пар «margin-анонс+символ» — середня зміна ціни
+# −0.24% за хвилину, −0.20% за пів години, обвал ≥10% у 0 (НУЛЬ) пар. Для порівняння
+# чистий спот-делістинг: −8.5% за хвилину, −12.6% за пів години, ≥10% у 69% пар.
+# Тому такі анонси НЕ торгуємо: це були б угоди на шум, які платять комісію і
+# випадково ловлять стоп.
+_MARGIN_SUBJ = re.compile(
+    r"(margin|loans?)\s+(and\s+(binance\s+)?loans?\s+)?will\s+delist"
+    r"|will\s+delist\b.*\b(from|on)\b.*\b(cross|isolated|margin|loans?)\b"
+    r"|will\s+delist\b.*\b(margin|earn)\s+(pairs?|products?)\b"
+    r"|margin\s+and\s+(binance\s+)?loans?\b",
+    re.IGNORECASE,
+)
 
 
 def classify(title: str) -> str:
@@ -32,7 +57,7 @@ def classify(title: str) -> str:
     if "futures will delist" in t or ("futures" in t and "delist" in t):
         return FUTURES_DELIST
     if "will delist" in t:
-        return SPOT_DELIST
+        return MARGIN_DELIST if _MARGIN_SUBJ.search(title) else SPOT_DELIST
     if "removal of" in t and ("trading pair" in t or "margin" in t):
         return PAIR_REMOVAL
     return OTHER
@@ -53,13 +78,52 @@ class DelistingEvent:
         return self.category == SPOT_DELIST
 
 
+# Перелік тикерів стоїть ПІСЛЯ дієслова і ДО хвоста («on 2026-08-17», «from Cross…»).
+# Вирізаємо саме цей сегмент — тоді можна не боятись коротких слів у решті заголовка
+# і дозволити однолітерні тикери (реальний приклад: «Will Delist COS, D, HIGH, MBOX»,
+# де старий код втрачав D через мінімум 2 символи, а THE — через стоп-слово).
+_SEG = re.compile(
+    r"\b(?:will\s+delist|delists?|delisting|removal\s+of|remove\s+of)\b\s*(.+)",
+    re.IGNORECASE,
+)
+_SEG_TAIL = re.compile(
+    r"\s+\b(?:on|from|at|effective|and\s+support|will\s+be)\b\s|\s+[-–—(]|\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _ticker_segment(title: str) -> str | None:
+    m = _SEG.search(title)
+    if not m:
+        return None
+    seg = m.group(1)
+    cut = _SEG_TAIL.search(seg)
+    if cut:
+        seg = seg[:cut.start()]
+    seg = seg.strip(" .,:-")
+    # Сегмент має виглядати як перелік тикерів, а не як фраза: інакше краще широкий режим.
+    words = re.findall(r"[A-Za-z0-9]+", seg)
+    if not words or len(words) > 12:
+        return None
+    lower = sum(1 for w in words if w.islower() or (w[:1].isupper() and w[1:].islower()))
+    if lower > max(1, len(words) // 3):
+        return None
+    return seg
+
+
 def extract_tickers(title: str) -> list[str]:
-    """Груба евристика: беремо UPPERCASE-токени 2-10 символів, чистимо стопслова."""
-    # Кандидати: слідом за 'Delist'/'Removal' зазвичай перелік тикерів.
-    candidates = re.findall(r"\b[A-Z0-9]{2,10}\b", title)
+    """Тикери з заголовка. Спершу пробуємо вирізати сегмент-перелік (точний режим),
+    інакше — старий широкий пошук по всьому заголовку з довшим списком стоп-слів."""
+    seg = _ticker_segment(title)
+    if seg is not None:
+        candidates = re.findall(r"\b[A-Z0-9]{1,12}\b", seg)
+        stop = _STOPWORDS
+    else:
+        candidates = re.findall(r"\b[A-Z0-9]{2,10}\b", title)
+        stop = _STOPWORDS_WIDE
     tickers, seen = [], set()
     for c in candidates:
-        if c in _STOPWORDS or c.isdigit() or c in seen:
+        if c in stop or c.isdigit() or c in seen:
             continue
         seen.add(c)
         tickers.append(c)

@@ -23,6 +23,7 @@ import config
 import dumpwatch
 import exchange
 import executor
+import fastcms
 import fastjson
 import logbook as log
 import pricecache
@@ -35,6 +36,7 @@ _LOOP = "asyncio"  # перезаписується в __main__ на "uvloop", �
 
 _CAT_LABEL = {
     bw.SPOT_DELIST: "🔴 ПОВНИЙ ДЕЛІСТИНГ ТОКЕНА (сигнал для шорта)",
+    bw.MARGIN_DELIST: "🔵 Делістинг лише з margin/loan (спот лишається — НЕ торгуємо)",
     bw.FUTURES_DELIST: "🟠 Делістинг ф'ючерсного контракту",
     bw.PAIR_REMOVAL: "🟡 Прибирання торгових пар",
     bw.OTHER: "⚪ Інше",
@@ -50,7 +52,8 @@ def _fmt_event(ev: bw.DelistingEvent) -> str:
     ]
     if ev.url:
         lines.append(f'<a href="{ev.url}">Анонс</a>')
-    lines.append("<i>(Фаза 1: сповіщення, без ордерів)</i>")
+    if not ev.actionable:
+        lines.append("<i>(не торгуємо: не повний спот-делістинг)</i>")
     return "\n".join(lines)
 
 
@@ -66,6 +69,24 @@ async def _fire_tickers(tickers: list[str], latency, source: str) -> None:
     await asyncio.gather(*(one(tk) for tk in tickers))
 
 
+async def _on_fastcms(ev: bw.DelistingEvent, latency, host: str) -> None:
+    """Подія від ВЛАСНОГО швидкого детектора (поллінг некешованого origin, ~0.4с).
+    Це той самий сигнал, що й WS-фід, але швидший — і без залежності від третьої сторони."""
+    executor.fire(tg.send_message(
+        f"⚡ <b>Власний детектор (+{latency}с, {host.split('.')[0]})</b>\n"
+        f"{_fmt_event(ev)}"
+    ))
+    if not (ev.actionable and ev.tickers):
+        return
+    if not config.FASTCMS_TRADE:
+        log.event("fastcms_no_trade", tickers=ev.tickers, reason="FASTCMS_TRADE=0")
+        return
+    if latency is not None and latency > config.MAX_SIGNAL_AGE_SEC:
+        log.event("fastcms_stale_no_trade", tickers=ev.tickers, latency_sec=latency)
+        return
+    await _fire_tickers(ev.tickers, latency, f"fastcms:{host.split('.')[0]}")
+
+
 async def _watch_loop() -> None:
     storage.init()
     print(f"[{dt.datetime.now():%H:%M:%S}] Старт. Уже бачених анонсів: {storage.seen_count()}")
@@ -77,7 +98,9 @@ async def _watch_loop() -> None:
             try:
                 events = await bw.fetch_new_events(session)
                 for ev in events:
-                    if storage.is_seen(ev.article_id):
+                    # Дедуп СПІЛЬНИЙ із fastcms і синхронний: обидва джерела читають той
+                    # самий ендпоінт, тож без спільної заявки був би дубль угоди.
+                    if not fastcms.claim(ev.article_id):
                         continue
                     storage.mark_seen(ev.article_id, ev.title)
                     now_ms = int(time.time() * 1000)
@@ -262,12 +285,16 @@ async def _handle_command(text: str) -> None:
         pcs = pricecache.stats()
         dw = dumpwatch.stats()
         hs = executor.hot_state()
+        fc = fastcms.stats()
         armed = len(await asyncio.to_thread(storage.armed_symbols, "bybit", config.LEVERAGE))
         mode = "🧪 DRY (авто)" if config.DRY_RUN else "⚠️ РЕАЛ (авто)"
         await tg.send_message(
             "📊 <b>Стан</b>\n"
             f"Авто-режим: {mode}\n"
             f"Тригер: {'⚡ WS' if config.CL_WS_KEY else '🐌 поллінг'}\n"
+            f"Власний детектор: {fc['polls']} опитів / {fc['errors']} збоїв, "
+            f"{fc['hosts']} хости, нових {fc['new']}, "
+            f"торгівля {'✅' if config.FASTCMS_TRADE else '⛔'}\n"
             f"Price-cache: {pcs['symbols']} симв., WS-оновлень {pcs['ws_msgs']}\n"
             f"Гарячих символів: {len(exchange.HOT)} | плече озброєно: {armed}\n"
             f"Луп: {_LOOP} | json: {fastjson.NAME}\n"
@@ -371,6 +398,10 @@ async def main() -> None:
         exchange.mark_leveraged("bybit", s)
     dumpwatch.set_handler(_on_dump)
     dumpwatch.install()
+    # Дедуп анонсів живе в fastcms і спільний із поллінг-сторожем. Праймимо ДО gather:
+    # інакше сторож на першому ж проході вважав би всі 20 наявних статей новими.
+    fastcms.set_handler(_on_fastcms)
+    log.event("fastcms_primed", seen=fastcms.prime())
     gcinfo = runtime.tune_gc()
     log.event("runtime", loop=_LOOP, json=fastjson.NAME, **gcinfo)
     log.event("startup", dry_run=config.DRY_RUN, venues=config.VENUE_PRIORITY,
@@ -395,7 +426,7 @@ async def main() -> None:
               "Запусти get_chat_id.py, щоб його дізнатися.")
     # WS-тригер, поллінг-сторож, monitor, keep-alive, price-cache, Telegram-команди,
     # пре-озброєння плеча і монітор лагу лупу — паралельно.
-    await asyncio.gather(_ws_loop(), _watch_loop(), _monitor_loop(),
+    await asyncio.gather(fastcms.run(), _ws_loop(), _watch_loop(), _monitor_loop(),
                          _keepalive_loop(), pricecache.run(), pricecache.ws_run(),
                          _command_loop(), _arm_leverage_loop(),
                          runtime.loop_lag_monitor())

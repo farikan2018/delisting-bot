@@ -80,6 +80,15 @@ def seen_count() -> int:
         return db.execute("SELECT COUNT(*) FROM seen_articles").fetchone()[0]
 
 
+def seen_ids(limit: int = 5000) -> list[str]:
+    """Останні бачені id — для памʼятного дедупу fastcms (щоб гарячий шлях не ходив у SQLite)."""
+    with _conn() as db:
+        rows = db.execute(
+            "SELECT article_id FROM seen_articles ORDER BY seen_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
 # ---- armed_leverage (плече, виставлене заздалегідь) ----
 # Bybit тримає плече на своїй стороні назавжди, тому виставити його достатньо ОДИН раз.
 # Записуємо в БД, щоб рестарт бота не бив API 800 разів заново.
