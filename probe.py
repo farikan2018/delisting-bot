@@ -40,11 +40,16 @@ HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json", "lang": "e
 # Ендпоінт без catalogId віддає всі 140 останніх статей по 7 розділах, тому дуель
 # ловить будь-який анонс, а не лише рідкі делістинги. Різниця detected_ms між двома
 # джерелами на одному article_id і є доказом виграшу.
+#
+# poll=3с, а не 1с: проба — дослідницька, а кожен HTTPS-запит на 2 vCPU коштує джитеру
+# event-loop у БОТА (перевірено: разом із fastcms 7 запитів/с підняли хвіст лагу з
+# p99 1.7-4.2мс / max 15мс до p99 16мс / max 52мс). Очікувана різниця між хостами —
+# десятки секунд, тож роздільної здатності 3с вистачає з головою.
 _CMS_ALL = ("/bapi/apex/v1/public/apex/cms/article/list/query"
             "?type=1&pageNo=1&pageSize=20")
 SOURCES = [
-    {"name": "cms_www_cached", "poll": 1.0, "url": f"https://www.binance.com{_CMS_ALL}"},
-    {"name": "cms_origin_fast", "poll": 1.0, "url": f"https://accounts.binance.com{_CMS_ALL}"},
+    {"name": "cms_www_cached", "poll": 3.0, "url": f"https://www.binance.com{_CMS_ALL}"},
+    {"name": "cms_origin_fast", "poll": 3.0, "url": f"https://accounts.binance.com{_CMS_ALL}"},
 ]
 
 

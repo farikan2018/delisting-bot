@@ -164,18 +164,27 @@ async def _prime_fetch() -> int:
     """ПЕРШИЙ запуск із порожньою БД: позначаємо наявні анонси як бачені БЕЗ сповіщень
     і без угод — інакше бот вистрелив би по всіх 20 старих статтях одразу."""
     n = 0
-    try:
-        timeout = aiohttp.ClientTimeout(total=config.FASTCMS_TIMEOUT_SEC * 3)
-        async with aiohttp.ClientSession(timeout=timeout, headers=_HDRS) as s:
-            async with s.get(f"https://{HOSTS[0]}{_PATH}") as r:
-                data = fastjson.loads(await r.read())
-        for art in _articles(data):
-            aid = str(art.get("id") or art.get("code") or art.get("title", ""))
-            if claim(aid):
-                storage.mark_seen(aid, art.get("title", ""))
-                n += 1
-    except Exception:  # noqa: BLE001
-        log.exception("fastcms: прайм не вдався")
+    timeout = aiohttp.ClientTimeout(total=config.FASTCMS_TIMEOUT_SEC * 3)
+    # Кілька спроб: якщо прайм не вдасться, перший же опит вважатиме всі 20 наявних
+    # статей новими і насипле 20 сповіщень (угоди відсіє MAX_SIGNAL_AGE_SEC, але шум лишиться).
+    for attempt, host in enumerate((HOSTS * 3)[:3], 1):
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=_HDRS) as s:
+                async with s.get(f"https://{host}{_PATH}") as r:
+                    if r.status != 200:
+                        raise RuntimeError(f"HTTP {r.status}")
+                    data = fastjson.loads(await r.read())
+            for art in _articles(data):
+                aid = str(art.get("id") or art.get("code") or art.get("title", ""))
+                if claim(aid):
+                    storage.mark_seen(aid, art.get("title", ""))
+                    n += 1
+            return n
+        except Exception as e:  # noqa: BLE001
+            log.event("fastcms_prime_retry", attempt=attempt, host=host,
+                      err=f"{type(e).__name__}: {e}")
+            await asyncio.sleep(1.5 * attempt)
+    log.info("fastcms: прайм не вдався 3 рази — можливі сповіщення по старих анонсах")
     return n
 
 
