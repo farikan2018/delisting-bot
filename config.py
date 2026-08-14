@@ -116,6 +116,15 @@ DUMP_COOLDOWN_SEC = float(_ENV.get("DUMP_COOLDOWN_SEC", "900") or "900")  # ан
 DUMP_MARKET_WIDE_N = int(_ENV.get("DUMP_MARKET_WIDE_N", "5") or "5")
 DUMP_MARKET_SEC = float(_ENV.get("DUMP_MARKET_SEC", "60") or "60")
 
+# --- Щоденне зведення ---
+# ОДНЕ повідомлення на добу: зворотний відлік до кінця безкоштовного періоду сервера
+# плюс короткий стан детектора. Дата останньої відправки лежить у таблиці meta, тому
+# перезапуск бота не надсилає зведення вдруге. Можна викликати вручну: /daily.
+DAILY_REPORT = (_ENV.get("DAILY_REPORT", "1").strip() != "0")
+DAILY_REPORT_HOUR_UTC = int(_ENV.get("DAILY_REPORT_HOUR_UTC", "7") or "7")
+# Дата, коли закінчується безкоштовний період машини (YYYY-MM-DD). Порожньо = без відліку.
+TRIAL_END_DATE = _ENV.get("TRIAL_END_DATE", "").strip()
+
 # Risk-ліміти
 MAX_CONCURRENT = int(_ENV.get("MAX_CONCURRENT", "3") or "3")             # макс. одночасних позицій
 # Свіжість сигналу: угоду відкриваємо лише якщо від публікації минуло <= стільки секунд.

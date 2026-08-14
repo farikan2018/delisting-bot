@@ -264,11 +264,77 @@ async def _arm_leverage_loop() -> None:
         await asyncio.sleep(config.ARM_REFRESH_SEC)
 
 
+def _days_left() -> int | None:
+    """Скільки днів до кінця безкоштовного періоду машини."""
+    if not config.TRIAL_END_DATE:
+        return None
+    try:
+        end = dt.datetime.strptime(config.TRIAL_END_DATE, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return (end - dt.datetime.now(dt.timezone.utc).date()).days
+
+
+async def _daily_text() -> str:
+    fc = fastcms.stats()
+    left = _days_left()
+    lines = ["📅 <b>Щоденне зведення</b>"]
+    if left is None:
+        lines.append("Безкоштовний період: дата не задана (<code>TRIAL_END_DATE</code>)")
+    elif left > 0:
+        lines.append(f"🗓 Безкоштовний сервер: залишилось <b>{left} дн.</b> "
+                     f"(до {config.TRIAL_END_DATE})")
+    elif left == 0:
+        lines.append(f"🔴 <b>Безкоштовний період закінчується СЬОГОДНІ</b> "
+                     f"({config.TRIAL_END_DATE})")
+    else:
+        lines.append(f"🔴 <b>Безкоштовний період скінчився {-left} дн. тому</b> — "
+                     f"машина вже або платна, або зупинена")
+    lines.append(f"⚡ Детект: {fc['polls']} опитів, помилок {fc['errors']}, "
+                 f"нових анонсів {fc['new']}")
+    lines.append(f"📊 Позицій відкрито: {storage.open_positions_count()} | "
+                 f"анонсів бачено: {fc['seen']}")
+    if left is not None and left <= 7:
+        # Нагадування саме тоді, коли ще є час діяти, а не після факту.
+        lines.append("\n⚠️ <b>Час вирішувати, куди переїжджати:</b>\n"
+                     "• Lightsail $7–12/міс у <code>ap-southeast-1</code> — дешевше "
+                     "за GCP і ще ближче до матчера Bybit\n"
+                     "• лишитись у GCP — ~$18/міс\n"
+                     "• назад у Франкфурт — безкоштовно, але ордер ~660мс замість ~200мс")
+    return "\n".join(lines)
+
+
+async def _daily_report_loop() -> None:
+    """ОДНЕ повідомлення на добу. Дата останньої відправки — у БД, щоб рестарт
+    (а їх буває багато) не сипав зведенням повторно."""
+    if not (config.DAILY_REPORT and config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID):
+        log.info("щоденне зведення вимкнено (DAILY_REPORT=0 або немає Telegram)")
+        return
+    hour = max(0, min(23, config.DAILY_REPORT_HOUR_UTC))
+    log.event("daily_report_armed", hour_utc=hour, trial_end=config.TRIAL_END_DATE or None)
+    while True:
+        now = dt.datetime.now(dt.timezone.utc)
+        target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += dt.timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+        try:
+            if await asyncio.to_thread(storage.meta_get, "daily_report_sent") == today:
+                continue
+            await tg.send_message(await _daily_text())
+            await asyncio.to_thread(storage.meta_set, "daily_report_sent", today)
+            log.event("daily_report_sent", date=today, days_left=_days_left())
+        except Exception:  # noqa: BLE001
+            log.exception("щоденне зведення не надіслалось")
+
+
 _HELP = (
     "🎛 <b>Команди</b>\n"
     "/status — стан бота\n"
     "/positions — відкриті позиції\n"
     "/test_short СИМВОЛ — <b>РЕАЛЬНИЙ</b> тест-шорт на ${margin:g} (напр. /test_short DOGE)\n"
+    "/daily — щоденне зведення зараз (скільки лишилось безкоштовного сервера)\n"
     "/close ID — закрити позицію за id\n"
     "/panic — 🛑 закрити ВСІ позиції\n"
     "/help — ця довідка"
@@ -307,6 +373,9 @@ async def _handle_command(text: str) -> None:
             + f"Відкритих позицій: {hs['open']} (у роботі {hs['reserved']})\n"
             f"Тест-маржа: ${config.TEST_MARGIN_USDT:g} × {config.LEVERAGE:g}x"
         )
+
+    elif cmd == "daily":
+        await tg.send_message(await _daily_text())
 
     elif cmd == "positions":
         rows = storage.get_open_positions()
@@ -448,7 +517,7 @@ async def main() -> None:
     await asyncio.gather(fastcms.run(), _ws_loop(), _watch_loop(), _monitor_loop(),
                          _keepalive_loop(), pricecache.run(), pricecache.ws_run(),
                          _command_loop(), _arm_leverage_loop(),
-                         runtime.loop_lag_monitor())
+                         _daily_report_loop(), runtime.loop_lag_monitor())
 
 
 if __name__ == "__main__":

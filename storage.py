@@ -19,6 +19,14 @@ def init() -> None:
             )"""
         )
         db.execute(
+            # Дрібний key-value для стану, який мусить пережити рестарт: наприклад дата
+            # останнього щоденного зведення, щоб перезапуск бота не надіслав його вдруге.
+            """CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            )"""
+        )
+        db.execute(
             """CREATE TABLE IF NOT EXISTS positions (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 ticker        TEXT,
@@ -78,6 +86,20 @@ def mark_seen(article_id: str, title: str) -> None:
 def seen_count() -> int:
     with _conn() as db:
         return db.execute("SELECT COUNT(*) FROM seen_articles").fetchone()[0]
+
+
+# ---- meta (дрібний стан, що переживає рестарт) ----
+def meta_get(key: str, default: str | None = None) -> str | None:
+    with _conn() as db:
+        row = db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def meta_set(key: str, value: str) -> None:
+    with _conn() as db:
+        db.execute("INSERT INTO meta (key, value) VALUES (?, ?) "
+                   "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+        db.commit()
 
 
 def seen_ids(limit: int = 5000) -> list[str]:
