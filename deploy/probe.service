@@ -12,6 +12,10 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/ubuntu/delisting-bot/.venv/bin/python /home/ubuntu/delisting-bot/probe.py
 Restart=always
 RestartSec=5
+# Проба — суто дослідницька, і вона НЕ має конкурувати з ботом за 2 vCPU в момент
+# ордера. Заміри показали сплески лагу event-loop у бота до ~50мс.
+Nice=10
+CPUWeight=100
 
 [Install]
 WantedBy=multi-user.target

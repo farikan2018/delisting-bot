@@ -12,6 +12,10 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/ubuntu/delisting-bot/.venv/bin/python /home/ubuntu/delisting-bot/main.py
 Restart=always
 RestartSec=5
+# Бот — головний процес на машині: ордер не має чекати, поки планувальник віддасть
+# CPU пробі чи ловцю A1. Разом із Nice=10 у probe.service це прибирає сплески лагу.
+Nice=-5
+CPUWeight=1000
 
 [Install]
 WantedBy=multi-user.target

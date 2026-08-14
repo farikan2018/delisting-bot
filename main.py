@@ -184,6 +184,9 @@ async def _keepalive_loop() -> None:
                 await asyncio.to_thread(exchange.warm_ping, v)
             except Exception:  # noqa: BLE001
                 log.exception(f"keepalive помилка {v}")
+            # Розводимо біржі в часі: підряд це 6 підписаних викликів, чий ccxt-парсинг
+            # тримає GIL і давав сплески лагу лупу до ~50мс (видно в loop_lag_high).
+            await asyncio.sleep(1)
 
 
 def _on_dump(sym: str, drop: float, top: float, price: float, span_ms: int) -> None:
