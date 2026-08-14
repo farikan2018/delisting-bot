@@ -52,7 +52,7 @@ _HDRS = {
 
 _seen: set[str] = set()          # заявлені article_id (синхронний дедуп)
 _on_event = None
-_stats = {"polls": 0, "errors": 0, "new": 0, "by_host": {}}
+_stats = {"polls": 0, "errors": 0, "new": 0, "by_host": {}, "polls_by_host": {}}
 
 
 def set_handler(cb) -> None:
@@ -144,6 +144,7 @@ async def _poll_host(host: str, phase: float) -> None:
                         raise RuntimeError(f"HTTP {r.status}")
                 data = fastjson.loads(body)
                 _stats["polls"] += 1
+                _stats["polls_by_host"][host] = _stats["polls_by_host"].get(host, 0) + 1
                 backoff = 0.0
                 for art in _articles(data):
                     await _handle(art, host)
@@ -188,6 +189,20 @@ async def _prime_fetch() -> int:
     return n
 
 
+async def _heartbeat(period: float = 300.0) -> None:
+    """Без цього неможливо відрізнити «поллінг іде 5/с» від «задача тихо померла»:
+    детектор молчить тижнями, бо делістингів 8-9 на рік. Логуємо ФАКТИЧНИЙ темп."""
+    last, t_last = 0, time.perf_counter()
+    while True:
+        await asyncio.sleep(period)
+        now = time.perf_counter()
+        rate = (_stats["polls"] - last) / (now - t_last) if now > t_last else 0.0
+        log.event("fastcms_heartbeat", polls=_stats["polls"], errors=_stats["errors"],
+                  new=_stats["new"], rate_per_sec=round(rate, 2), seen=len(_seen),
+                  by_host=_stats["polls_by_host"])
+        last, t_last = _stats["polls"], now
+
+
 async def run() -> None:
     """Піднімає по задачі на хост зі зсувом фази (рівномірне покриття інтервалу)."""
     if not config.FASTCMS:
@@ -196,10 +211,17 @@ async def run() -> None:
     hosts = HOSTS[:max(1, config.FASTCMS_HOSTS)]
     primed = prime()
     if primed == 0:
-        primed = await _prime_fetch()
-        log.info(f"fastcms: перший запуск — {primed} наявних анонсів позначено баченими")
+        # Поллінг-сторож праймиться паралельно і читає ТОЙ САМИЙ ендпоінт, тож він може
+        # заявити всі статті раніше за нас — тоді claimed=0 при 20 бачених. Це нормально
+        # (жоден із двох шляхів не сповіщає під час прайму), тому логуємо обидва числа,
+        # інакше «0» виглядає як зламаний прайм.
+        claimed = await _prime_fetch()
+        primed = seen_count()
+        log.info(f"fastcms: перший запуск — заявлено {claimed}, всього бачених {primed} "
+                 f"(решту міг заявити поллінг-сторож)")
     step = config.FASTCMS_POLL_SEC / len(hosts)
     log.event("fastcms_start", hosts=hosts, poll_sec=config.FASTCMS_POLL_SEC,
               effective_gap_ms=round(step * 1000), primed_seen=primed,
               trade=config.FASTCMS_TRADE)
-    await asyncio.gather(*(_poll_host(h, i * step) for i, h in enumerate(hosts)))
+    await asyncio.gather(_heartbeat(),
+                         *(_poll_host(h, i * step) for i, h in enumerate(hosts)))
