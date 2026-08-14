@@ -26,20 +26,25 @@ _OUT = _LOGDIR / "probe.jsonl"
 POLL = 5.0  # дефолтний інтервал
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json", "lang": "en"}
 
-# Джерела CMS. ВАЖЛИВО (виміряно 2026-08-14): ці ендпоінти віддаються через CloudFront
-# із TTL ~120с, і обійти кеш не вдалось (невідомий query-параметр → 400, ротація pageSize
-# → 400, Cache-Control: no-cache → ігнорується). Тому поллінг частіше ніж раз на ~15с —
-# чисте марнування CPU: він перечитує той самий кешований обʼєкт. Колишні 0.5с прибрано.
-# Роль CMS тепер одна: дати releaseDate (штамп публікації Binance), щоб зіставити його з
-# detectedTimestampUs із WS-фіда й нарешті зміряти РЕАЛЬНУ затримку cryptolisting.
-# catalogId=161 — делістинги (рідкі), 48 — нові лістинги (часті, дають статистику швидко).
+# Джерела CMS — тепер це ПРЯМА дуель кешованого хоста проти некешованого.
+#
+# Виміряно 2026-08-14, і попереднє твердження в цьому файлі («обійти кеш не вдалось»)
+# СПРОСТОВАНО: обійти не вдалось лише на www.binance.com. Там CloudFront тримає обʼєкт
+# із TTL ~120с (заголовок Age росте 0→120 і скидається), а трюки з query-параметрами
+# дають 400, а Cache-Control/Pragma: no-cache CDN ігнорує.
+# Але ТОЙ САМИЙ ендпоінт на інших хостах Binance віддається без кешу взагалі:
+#   accounts.binance.com / p2p.binance.com / launchpad.binance.com
+#   → X-Cache: Miss from cloudfront на КОЖНОМУ запиті, заголовка Age немає, RTT ~260мс.
+# (www.binance.info має власний кеш із TTL ~30с — не годиться.)
+#
+# Ендпоінт без catalogId віддає всі 140 останніх статей по 7 розділах, тому дуель
+# ловить будь-який анонс, а не лише рідкі делістинги. Різниця detected_ms між двома
+# джерелами на одному article_id і є доказом виграшу.
+_CMS_ALL = ("/bapi/apex/v1/public/apex/cms/article/list/query"
+            "?type=1&pageNo=1&pageSize=20")
 SOURCES = [
-    {"name": "cms_delist", "poll": 15.0,
-     "url": "https://www.binance.com/bapi/apex/v1/public/apex/cms/article/list/query"
-            "?type=1&catalogId=161&pageNo=1&pageSize=20"},
-    {"name": "cms_listing", "poll": 15.0,
-     "url": "https://www.binance.com/bapi/apex/v1/public/apex/cms/article/list/query"
-            "?type=1&catalogId=48&pageNo=1&pageSize=20"},
+    {"name": "cms_www_cached", "poll": 1.0, "url": f"https://www.binance.com{_CMS_ALL}"},
+    {"name": "cms_origin_fast", "poll": 1.0, "url": f"https://accounts.binance.com{_CMS_ALL}"},
 ]
 
 
