@@ -136,7 +136,6 @@ async def _poll_host(host: str, phase: float) -> None:
     async with aiohttp.ClientSession(connector=conn, timeout=timeout,
                                      headers=_HDRS) as sess:
         while True:
-            t0 = time.perf_counter()
             try:
                 async with sess.get(url) as r:
                     body = await r.read()
@@ -157,8 +156,22 @@ async def _poll_host(host: str, phase: float) -> None:
                     log.event("fastcms_error", host=host, err=f"{type(e).__name__}: {e}",
                               errors=_stats["errors"], polls=_stats["polls"])
                 backoff = min(30.0, (backoff or config.FASTCMS_POLL_SEC) * 2)
-            elapsed = time.perf_counter() - t0
-            await asyncio.sleep(max(0.05, (backoff or config.FASTCMS_POLL_SEC) - elapsed))
+            if backoff:
+                await asyncio.sleep(backoff)
+                continue
+            # Фазу тримаємо по СТІННОМУ годиннику (UTC), а не від моменту старту процесу.
+            # Дає дві речі:
+            #  1) ефективний інтервал строго POLL/N і не «поїде» після повільного запиту
+            #     (у Франкфурті так набігало 218мс замість 200мс: p2p/launchpad інколи
+            #     перевищували 550мс і цикл розтягувався);
+            #  2) дві машини опитують у ТІ САМІ моменти, тому на живому анонсі різниця
+            #     детекту дорівнює різниці RTT, а не лотереї «кому пощастило з циклом».
+            #     Без цього шум ±POLL змазав би замір, а подій усього 8-9 на рік.
+            now = time.time()
+            nxt = (now // config.FASTCMS_POLL_SEC) * config.FASTCMS_POLL_SEC + phase
+            while nxt <= now:
+                nxt += config.FASTCMS_POLL_SEC
+            await asyncio.sleep(nxt - now)
 
 
 async def _prime_fetch() -> int:
