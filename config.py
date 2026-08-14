@@ -97,6 +97,11 @@ PRICECACHE_WS = (_ENV.get("PRICECACHE_WS", "1").strip() != "0")
 # За замовчуванням торгівля ВИКЛЮЧЕНА: це інша стратегія (реакція ринку, не новина).
 DUMPWATCH = (_ENV.get("DUMPWATCH", "1").strip() != "0")
 DUMPWATCH_TRADE = (_ENV.get("DUMPWATCH_TRADE", "0").strip() != "0")
+# Сповіщення в Telegram про кожен обвал. За замовчуванням ВИКЛЮЧЕНО: при DUMP_PCT=4
+# за 20с по 826 символах це ~7 повідомлень на годину рівно на порозі (4.0-4.5%) —
+# звичайна волатильність альтів, не делістинги. Детект лишається й пише в лог
+# (`dump_detected`), тож дані для оцінки стратегії не втрачаються.
+DUMPWATCH_ALERT = (_ENV.get("DUMPWATCH_ALERT", "0").strip() != "0")
 DUMP_PCT = float(_ENV.get("DUMP_PCT", "4") or "4")               # просадка у % → тригер
 DUMP_WINDOW_SEC = float(_ENV.get("DUMP_WINDOW_SEC", "20") or "20")  # за який час
 DUMP_MAXLEN = int(_ENV.get("DUMP_MAXLEN", "64") or "64")         # довжина вікна на символ

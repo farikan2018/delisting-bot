@@ -216,12 +216,14 @@ def _on_dump(sym: str, drop: float, top: float, price: float, span_ms: int) -> N
     """Колбек детектора обвалу. Летить на WS-гарячому шляху → все важке у фон (fire).
     Торгуємо лише якщо DUMPWATCH_TRADE=1; інакше це чистий замір + сповіщення."""
     ticker = exchange.ticker_by_raw(sym)
-    act = "відкриваю шорт" if (config.DUMPWATCH_TRADE and ticker) else "лише сповіщення (тінь)"
-    executor.fire(tg.send_message(
-        f"📉 <b>ОБВАЛ: {ticker or sym}</b>\n"
-        f"−{drop:.1f}% за {span_ms / 1000:.1f}с ({top:g} → {price:g})\n"
-        f"<i>{act}</i>"
-    ))
+    # Сповіщення — лише за явним DUMPWATCH_ALERT=1. Детект пише в лог завжди.
+    if config.DUMPWATCH_ALERT:
+        act = "відкриваю шорт" if (config.DUMPWATCH_TRADE and ticker) else "лише сповіщення (тінь)"
+        executor.fire(tg.send_message(
+            f"📉 <b>ОБВАЛ: {ticker or sym}</b>\n"
+            f"−{drop:.1f}% за {span_ms / 1000:.1f}с ({top:g} → {price:g})\n"
+            f"<i>{act}</i>"
+        ))
     if config.DUMPWATCH_TRADE and ticker:
         executor.fire(executor.open_from_signal(ticker, detect_latency=span_ms / 1000,
                                                 source="dumpwatch"))
@@ -298,7 +300,8 @@ async def _handle_command(text: str) -> None:
             f"Price-cache: {pcs['symbols']} симв., WS-оновлень {pcs['ws_msgs']}\n"
             f"Гарячих символів: {len(exchange.HOT)} | плече озброєно: {armed}\n"
             f"Луп: {_LOOP} | json: {fastjson.NAME}\n"
-            f"Обвал-детектор: {dw['tracked']} симв., алертів {dw['alerts']}, "
+            f"Обвал-детектор: {dw['tracked']} симв., спрацювань {dw['alerts']}, "
+            f"сповіщення {'✅' if config.DUMPWATCH_ALERT else '⛔ тільки в лог'}, "
             f"торгівля {'✅' if config.DUMPWATCH_TRADE else '⛔ тінь'}\n"
             f"Відкритих позицій: {hs['open']} (у роботі {hs['reserved']})\n"
             f"Тест-маржа: ${config.TEST_MARGIN_USDT:g} × {config.LEVERAGE:g}x"
