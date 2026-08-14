@@ -32,7 +32,19 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _update(sym: str, price: float, now_ms: int) -> None:
+_subscribers: list = []  # cb(sym, price, now_ms) — викликається на КОЖНОМУ оновленні
+
+
+def subscribe(cb) -> None:
+    """Підписка на потік оновлень цін (для детектора обвалу). Колбек летить на
+    гарячому WS-шляху (~86 оновлень/с), тому має бути дешевим і без await."""
+    _subscribers.append(cb)
+
+
+def _update(sym: str, price: float, now_ms: int, notify: bool = True) -> None:
+    """notify=False для масового знімка: інакше один прохід по 800+ символах смикав
+    детектор обвалу 800 разів підряд і затирав event-loop на ~50мс кожні 2с (виміряно
+    монітором лагу). Детектор має жити лише на WS-дельтах — вони й так реал-тайм."""
     _last[sym] = price
     _last_ts[sym] = now_ms
     minute = now_ms // 60000
@@ -43,6 +55,12 @@ def _update(sym: str, price: float, now_ms: int) -> None:
     if len(buckets) > keep:  # прибрати застарілі хвилини
         for m in sorted(buckets)[:-keep]:
             buckets.pop(m, None)
+    if notify:
+        for cb in _subscribers:
+            try:
+                cb(sym, price, now_ms)
+            except Exception:  # noqa: BLE001
+                pass  # детектор не має права зламати кеш цін
 
 
 def get_price(sym: str):
@@ -135,11 +153,14 @@ async def run() -> None:
                         # тримати луп і не сипати обʼєктами під ноги збирачу.
                         data = fastjson.loads(await r.read())
                         now_ms = _now_ms()
-                        for t in ((data.get("result") or {}).get("list") or []):
+                        rows = (data.get("result") or {}).get("list") or []
+                        for i, t in enumerate(rows):
                             try:
-                                _update(t["symbol"], float(t["lastPrice"]), now_ms)
+                                _update(t["symbol"], float(t["lastPrice"]), now_ms, notify=False)
                             except (KeyError, ValueError, TypeError):
                                 continue
+                            if i % 250 == 249:
+                                await asyncio.sleep(0)  # віддати луп: 800 символів за раз
                         _updated_ms = now_ms
                         if not primed:  # перший успішний знімок
                             log.event("pricecache_primed", **stats())

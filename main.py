@@ -20,6 +20,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 import binance_watcher as bw
 import config
+import dumpwatch
 import exchange
 import executor
 import fastjson
@@ -185,6 +186,21 @@ async def _keepalive_loop() -> None:
                 log.exception(f"keepalive помилка {v}")
 
 
+def _on_dump(sym: str, drop: float, top: float, price: float, span_ms: int) -> None:
+    """Колбек детектора обвалу. Летить на WS-гарячому шляху → все важке у фон (fire).
+    Торгуємо лише якщо DUMPWATCH_TRADE=1; інакше це чистий замір + сповіщення."""
+    ticker = exchange.ticker_by_raw(sym)
+    act = "відкриваю шорт" if (config.DUMPWATCH_TRADE and ticker) else "лише сповіщення (тінь)"
+    executor.fire(tg.send_message(
+        f"📉 <b>ОБВАЛ: {ticker or sym}</b>\n"
+        f"−{drop:.1f}% за {span_ms / 1000:.1f}с ({top:g} → {price:g})\n"
+        f"<i>{act}</i>"
+    ))
+    if config.DUMPWATCH_TRADE and ticker:
+        executor.fire(executor.open_from_signal(ticker, detect_latency=span_ms / 1000,
+                                                source="dumpwatch"))
+
+
 async def _arm_leverage_loop() -> None:
     """Озброює плече по ВСІХ символах заздалегідь. Перший ордер по «новому» символу
     інакше платить +165мс за set_leverage — а делістинг це завжди новий символ.
@@ -241,6 +257,7 @@ async def _handle_command(text: str) -> None:
 
     elif cmd == "status":
         pcs = pricecache.stats()
+        dw = dumpwatch.stats()
         hs = executor.hot_state()
         armed = len(await asyncio.to_thread(storage.armed_symbols, "bybit", config.LEVERAGE))
         mode = "🧪 DRY (авто)" if config.DRY_RUN else "⚠️ РЕАЛ (авто)"
@@ -251,6 +268,8 @@ async def _handle_command(text: str) -> None:
             f"Price-cache: {pcs['symbols']} симв., WS-оновлень {pcs['ws_msgs']}\n"
             f"Гарячих символів: {len(exchange.HOT)} | плече озброєно: {armed}\n"
             f"Луп: {_LOOP} | json: {fastjson.NAME}\n"
+            f"Обвал-детектор: {dw['tracked']} симв., алертів {dw['alerts']}, "
+            f"торгівля {'✅' if config.DUMPWATCH_TRADE else '⛔ тінь'}\n"
             f"Відкритих позицій: {hs['open']} (у роботі {hs['reserved']})\n"
             f"Тест-маржа: ${config.TEST_MARGIN_USDT:g} × {config.LEVERAGE:g}x"
         )
@@ -337,9 +356,18 @@ async def main() -> None:
     storage.init()
     executor.resync_open()  # люстро відкритих позицій у памʼять (дедуп на гарячому шляху)
     # Пре-обчислення всього, що потрібно для входу: venue+symbol+raw_id+contract_size по
-    # кожному тикеру. Це тягне ccxt-markets (~4с) — свідомо на СТАРТІ, а не на сигналі.
-    st = await asyncio.to_thread(exchange.prearm_symbols)
-    log.event("prearm_symbols", **st)
+    # кожному тикеру. Тягне ccxt-markets — свідомо на СТАРТІ, а не на сигналі. Біржі
+    # вантажимо паралельно: послідовно це 23с, коли бот ще нічого не чує.
+    t0 = time.perf_counter()
+    await asyncio.gather(*(asyncio.to_thread(exchange.client, v)
+                           for v in config.VENUE_PRIORITY), return_exceptions=True)
+    st = exchange.prearm_symbols()  # уже лише памʼять
+    log.event("prearm_symbols", load_ms=round((time.perf_counter() - t0) * 1000), **st)
+    # Символи, де плече вже виставлено раніше — щоб ордер не бив set_leverage вдруге.
+    for s in await asyncio.to_thread(storage.armed_symbols, "bybit", config.LEVERAGE):
+        exchange.mark_leveraged("bybit", s)
+    dumpwatch.set_handler(_on_dump)
+    dumpwatch.install()
     gcinfo = runtime.tune_gc()
     log.event("runtime", loop=_LOOP, json=fastjson.NAME, **gcinfo)
     log.event("startup", dry_run=config.DRY_RUN, venues=config.VENUE_PRIORITY,

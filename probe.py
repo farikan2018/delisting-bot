@@ -194,9 +194,17 @@ def _jwt_subjects(creds: str) -> list:
 
 
 async def watch_odin():
-    """Слухає нативний push-канал Binance (Odin/NATS). Логує КОЖНЕ повідомлення —
-    щоб на живому делістингу побачити, чи він приходить сюди й наскільки швидше за
-    apex/cryptolisting. Creds живуть 5хв → пере-реєстрація+реконект кожні ~4хв."""
+    """Слухає нативний push-канал Binance (Odin/NATS). Логує КОЖНЕ повідомлення.
+
+    РЕЗУЛЬТАТ РОЗБОРУ (важливо, щоб не витрачати час удруге): анонімна реєстрація
+    видає JWT, у якому sub.allow — це ЛИШЕ приватні subjects власної сесії:
+      push.inbox.sys.<appId>, push.inbox.<appId>.*,
+      push.inbox.<uuid>.<appId>.>, push.inbox.immed.<uuid>.<appId>
+    Публічних broadcast-топіків немає. Зате є pub.allow на push.outbox.<uuid>.<appId>.>,
+    тобто клієнт спершу ПУБЛІКУЄ запит на підписку, і лише тоді сервер кладе події в
+    inbox. Ми такого запиту не надсилаємо → канал законно молчить (0 повідомлень).
+    Формат outbox-запиту невідомий; поки тримаємо слухача як дешевий монітор.
+    Creds живуть 300с (exp-iat) → пере-реєстрація кожні ~250с."""
     try:
         import nats
     except Exception as e:  # noqa: BLE001
@@ -215,8 +223,10 @@ async def watch_odin():
             f = tempfile.NamedTemporaryFile("w", suffix=".creds", delete=False)
             f.write(data["creds"]); f.close()
             credfile = f.name
+            # ping_interval — інакше сервер рвав конект приблизно щоп70с (UnexpectedEOF).
             nc = await nats.connect(servers=data["addrs"], user_credentials=credfile,
-                                    connect_timeout=10, max_reconnect_attempts=3)
+                                    connect_timeout=10, max_reconnect_attempts=3,
+                                    ping_interval=20, max_outstanding_pings=5)
             print(f"odin: підключено -> {nc.connected_url.netloc if nc.connected_url else '?'}, "
                   f"subjects={len(subs)}", flush=True)
 

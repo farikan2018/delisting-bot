@@ -65,10 +65,14 @@ MAX_HOLD_MINUTES = float(_ENV.get("MAX_HOLD_MINUTES", "45") or "45")            
 # Перевірка виходу тепер читає ціну з price-cache (0 мережі), тому частіше = безкоштовно.
 EXIT_CHECK_SEC = float(_ENV.get("EXIT_CHECK_SEC", "2") or "2")                      # частота перевірки позицій
 
-# Пре-озброєння плеча: виставити LEVERAGE по всіх символах ЗАЗДАЛЕГІДЬ, щоб бойовий
+# Пре-озброєння плеча: виставити LEVERAGE по ВСІХ символах ЗАЗДАЛЕГІДЬ, щоб бойовий
 # ордер не платив +165мс за set_leverage (делістинг — це завжди «новий» символ).
 # Робиться один раз (стан у БД), потім лише для нових листингів раз на ARM_REFRESH_SEC.
-ARM_LEVERAGE = (_ENV.get("ARM_LEVERAGE", "1").strip() != "0")
+# ВИМКНЕНО за замовчуванням свідомо: це масова зміна налаштувань акаунта на біржі
+# (~700 підписаних викликів). Поки вимкнено, ордер по неозброєному символу спершу
+# виставляє плече сам (+165мс) — бо інакше при дефолтних 10x стоп і ліквідація
+# майже збігаються. ARM_LEVERAGE=1 повертає ці 165мс.
+ARM_LEVERAGE = (_ENV.get("ARM_LEVERAGE", "0").strip() != "0")
 ARM_SLEEP_SEC = float(_ENV.get("ARM_SLEEP_SEC", "0.15") or "0.15")   # пауза між викликами (rate-limit)
 ARM_REFRESH_SEC = float(_ENV.get("ARM_REFRESH_SEC", "21600") or "21600")  # 6г: догнати нові символи
 
@@ -84,6 +88,22 @@ PRICECACHE_MAX_AGE_SEC = float(_ENV.get("PRICECACHE_MAX_AGE_SEC", "10") or "10")
 # WS реал-тайм шар: стрім tickers усіх перпів (ціна оновлюється в реальному часі).
 # 1=увімк (максимальна свіжість, основа для детектора обвалу). Знімок лишається сідом/страховкою.
 PRICECACHE_WS = (_ENV.get("PRICECACHE_WS", "1").strip() != "0")
+
+# --- Детектор обвалу (dumpwatch) ---
+# Анонси Binance кешує CloudFront із TTL ~120с (виміряно), обійти не вдалось; нативний
+# push Binance публічних топіків не дає. Найшвидше, що до нас доходить — сам рух ціни:
+# Bybit-стрім tickers має затримку 81мс (виміряно). Тому обвал = тригер.
+# DUMPWATCH=1 — детектор працює й СПОВІЩАЄ; DUMPWATCH_TRADE=1 — ще й відкриває угоди.
+# За замовчуванням торгівля ВИКЛЮЧЕНА: це інша стратегія (реакція ринку, не новина).
+DUMPWATCH = (_ENV.get("DUMPWATCH", "1").strip() != "0")
+DUMPWATCH_TRADE = (_ENV.get("DUMPWATCH_TRADE", "0").strip() != "0")
+DUMP_PCT = float(_ENV.get("DUMP_PCT", "4") or "4")               # просадка у % → тригер
+DUMP_WINDOW_SEC = float(_ENV.get("DUMP_WINDOW_SEC", "20") or "20")  # за який час
+DUMP_MAXLEN = int(_ENV.get("DUMP_MAXLEN", "64") or "64")         # довжина вікна на символ
+DUMP_COOLDOWN_SEC = float(_ENV.get("DUMP_COOLDOWN_SEC", "900") or "900")  # антиспам на символ
+# Якщо одночасно просіло стільки ж інших символів — це обвал РИНКУ, а не делістинг.
+DUMP_MARKET_WIDE_N = int(_ENV.get("DUMP_MARKET_WIDE_N", "5") or "5")
+DUMP_MARKET_SEC = float(_ENV.get("DUMP_MARKET_SEC", "60") or "60")
 
 # Risk-ліміти
 MAX_CONCURRENT = int(_ENV.get("MAX_CONCURRENT", "3") or "3")             # макс. одночасних позицій

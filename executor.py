@@ -166,10 +166,15 @@ async def open_from_signal(ticker: str, detect_latency=None, real=None, margin=N
         contract_size = meta["contract_size"]
         prep_ms = round((time.perf_counter() - t_sig) * 1000, 1)
 
-        # 5) ОРДЕР. Плече вже озброєне фоново — тут його не торкаємось.
+        # 5) ОРДЕР. Якщо плече по символу вже озброєне (фоново) — летимо одразу.
+        # Якщо ні — спершу виставляємо його (+165мс): при біржовому дефолті 10x наш
+        # стоп −30% маржі і ліквідація опиняються майже в одній точці, і це гірше за
+        # втрачені мілісекунди. ARM_LEVERAGE=1 прибирає цей крок назовсім.
         order_ms = None
         order = None
         if real:
+            if not exchange.is_leveraged(venue, symbol):
+                await asyncio.to_thread(exchange.ensure_leverage, venue, symbol, config.LEVERAGE)
             t_ord = time.perf_counter()
             try:
                 order = await asyncio.to_thread(exchange.open_short, venue, symbol, contracts)

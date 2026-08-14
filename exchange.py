@@ -150,7 +150,12 @@ def contracts_for(venue: str, symbol: str, notional_usdt: float, price: float) -
 # ---- Гарячий шлях: пре-обчислена мета символів ----
 # Усе, що потрібно для відкриття, порахуємо ОДИН раз на старті. На сигналі — лише
 # пошук у дикті: ні мережі, ні перебору бірж, ні перемикання в потік.
-HOT: dict[str, dict] = {}  # "DOGE" -> {venue, symbol, raw_id, contract_size}
+HOT: dict[str, dict] = {}      # "DOGE" -> {venue, symbol, raw_id, contract_size}
+BY_RAW: dict[str, str] = {}    # "DOGEUSDT" -> "DOGE" (зворотний шлях для детектора обвалу)
+
+
+def ticker_by_raw(raw: str) -> str | None:
+    return BY_RAW.get(raw)
 
 
 def prearm_symbols() -> dict:
@@ -158,6 +163,7 @@ def prearm_symbols() -> dict:
     Перша біржа, де токен є, і виграє — та сама логіка, що в resolve(), але
     порахована заздалегідь."""
     HOT.clear()
+    BY_RAW.clear()
     per_venue = {}
     for v in config.VENUE_PRIORITY:
         try:
@@ -175,6 +181,8 @@ def prearm_symbols() -> dict:
                 continue
             HOT[base] = {"venue": v, "symbol": sym, "raw_id": m.get("id"),
                          "contract_size": m.get("contractSize") or 1}
+            if v == "bybit" and m.get("id"):  # детектор обвалу знає лише сирий bybit-ID
+                BY_RAW[m["id"]] = base
             n += 1
         per_venue[v] = n
     return {"total": len(HOT), **per_venue}
