@@ -51,6 +51,11 @@ _HDRS = {
 }
 
 _seen: set[str] = set()          # заявлені article_id (синхронний дедуп)
+# (article_id, host) — щоб зафіксувати, коли КОЖЕН хост уперше побачив статтю, а не лише
+# той, хто виграв заявку. Без цього парне порівняння двох машин ламається: якщо в
+# Сінгапурі першим спрацював accounts, а у Франкфурті p2p, ми порівнювали б різні хости
+# з різними RTT. Подій 8-9 на рік, тому кожна має дати однозначні дані.
+_sighted: set[tuple[str, str]] = set()
 _on_event = None
 _stats = {"polls": 0, "errors": 0, "new": 0, "by_host": {}, "polls_by_host": {}}
 
@@ -101,11 +106,20 @@ async def _handle(art: dict, host: str) -> None:
     if not bw._DELIST_HINT.search(title):
         return
     aid = str(art.get("id") or art.get("code") or title)
-    if not claim(aid):
-        return
     now_ms = int(time.time() * 1000)
     release_ms = art.get("releaseDate")
     latency = round((now_ms - release_ms) / 1000, 2) if release_ms else None
+    # Замір по кожному хосту окремо — лише для СВІЖИХ статей (10хв), щоб прайм і
+    # старий архів не сипали в лог. Ключ до порівняння двох машин на одній новині.
+    sight = (aid, host)
+    if sight not in _sighted and release_ms and (now_ms - release_ms) < 600_000:
+        if len(_sighted) > 10_000:
+            _sighted.clear()
+        _sighted.add(sight)
+        log.event("fastcms_sighting", article_id=aid, host=host, release_ms=release_ms,
+                  detected_ms=now_ms, detect_latency_sec=latency, title=title[:80])
+    if not claim(aid):
+        return
     code = art.get("code", "")
     ev = bw.DelistingEvent(
         article_id=aid, title=title, tickers=bw.extract_tickers(title),
