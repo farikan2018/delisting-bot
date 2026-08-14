@@ -300,10 +300,11 @@ async def _handle_command(text: str) -> None:
             f"Price-cache: {pcs['symbols']} симв., WS-оновлень {pcs['ws_msgs']}\n"
             f"Гарячих символів: {len(exchange.HOT)} | плече озброєно: {armed}\n"
             f"Луп: {_LOOP} | json: {fastjson.NAME}\n"
-            f"Обвал-детектор: {dw['tracked']} симв., спрацювань {dw['alerts']}, "
-            f"сповіщення {'✅' if config.DUMPWATCH_ALERT else '⛔ тільки в лог'}, "
-            f"торгівля {'✅' if config.DUMPWATCH_TRADE else '⛔ тінь'}\n"
-            f"Відкритих позицій: {hs['open']} (у роботі {hs['reserved']})\n"
+            + (f"Обвал-детектор: {dw['tracked']} симв., спрацювань {dw['alerts']}, "
+               f"сповіщення {'✅' if config.DUMPWATCH_ALERT else '⛔ тільки в лог'}, "
+               f"торгівля {'✅' if config.DUMPWATCH_TRADE else '⛔ тінь'}\n"
+               if config.DUMPWATCH else "Обвал-детектор: ⛔ вимкнено\n")
+            + f"Відкритих позицій: {hs['open']} (у роботі {hs['reserved']})\n"
             f"Тест-маржа: ${config.TEST_MARGIN_USDT:g} × {config.LEVERAGE:g}x"
         )
 
