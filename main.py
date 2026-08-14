@@ -393,10 +393,23 @@ async def main() -> None:
     # кожному тикеру. Тягне ccxt-markets — свідомо на СТАРТІ, а не на сигналі. Біржі
     # вантажимо паралельно: послідовно це 23с, коли бот ще нічого не чує.
     t0 = time.perf_counter()
-    await asyncio.gather(*(asyncio.to_thread(exchange.client, v)
-                           for v in config.VENUE_PRIORITY), return_exceptions=True)
+    loaded = await asyncio.gather(*(asyncio.to_thread(exchange.client, v)
+                                    for v in config.VENUE_PRIORITY), return_exceptions=True)
+    # return_exceptions тут потрібен (одна мертва біржа не має валити старт), але БЕЗ
+    # цього логу він глитав падіння молча. Реальний випадок: ключ Bybit був привʼязаний
+    # до старого IP, ccxt робить підписаний виклик уже в load_markets → Bybit не піднявся
+    # взагалі, символи забрав MEXC, і єдиним слідом було відсутнє поле bybit= нижче.
+    # Бот при цьому «працював» — і симулював би на не тій біржі.
+    for venue, res in zip(config.VENUE_PRIORITY, loaded):
+        if isinstance(res, BaseException):
+            log.event("venue_load_failed", venue=venue,
+                      err=f"{type(res).__name__}: {res}"[:250])
     st = exchange.prearm_symbols()  # уже лише памʼять
     log.event("prearm_symbols", load_ms=round((time.perf_counter() - t0) * 1000), **st)
+    missing = [v for v in config.VENUE_PRIORITY if not st.get(v)]
+    if missing:
+        log.event("venues_missing", missing=missing,
+                  hint="перевір ключі та IP-привʼязку API-ключа на біржі")
     # Символи, де плече вже виставлено раніше — щоб ордер не бив set_leverage вдруге.
     for s in await asyncio.to_thread(storage.armed_symbols, "bybit", config.LEVERAGE):
         exchange.mark_leveraged("bybit", s)
@@ -422,7 +435,9 @@ async def main() -> None:
             f"Режим: {mode}\n"
             f"Тригер: {trigger} | поллінг-сторож {config.POLL_INTERVAL:g}с\n"
             f"Біржі: {' → '.join(config.VENUE_PRIORITY)}\n"
-            f"Маржа ${config.POSITION_MARGIN_USDT:g} × {config.LEVERAGE:g}x\n"
+            + (f"⚠️ <b>НЕ піднялись: {', '.join(missing)}</b> — перевір ключі "
+               f"та IP-привʼязку!\n" if missing else "")
+            + f"Маржа ${config.POSITION_MARGIN_USDT:g} × {config.LEVERAGE:g}x\n"
             f"Відкритих позицій: {open_n}"
         )
     else:
