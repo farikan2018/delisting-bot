@@ -26,29 +26,32 @@ _OUT = _LOGDIR / "probe.jsonl"
 POLL = 5.0  # дефолтний інтервал
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json", "lang": "en"}
 
-# Джерела для порівняння. Мета Кроку 1: чи наш ШВИДКИЙ self-poll apex зрівняється/
-# обіжене cryptolisting-WS. composite тримаємо повільним (він 429-ить), apex — швидко.
+# Джерела CMS. ВАЖЛИВО (виміряно 2026-08-14): ці ендпоінти віддаються через CloudFront
+# із TTL ~120с, і обійти кеш не вдалось (невідомий query-параметр → 400, ротація pageSize
+# → 400, Cache-Control: no-cache → ігнорується). Тому поллінг частіше ніж раз на ~15с —
+# чисте марнування CPU: він перечитує той самий кешований обʼєкт. Колишні 0.5с прибрано.
+# Роль CMS тепер одна: дати releaseDate (штамп публікації Binance), щоб зіставити його з
+# detectedTimestampUs із WS-фіда й нарешті зміряти РЕАЛЬНУ затримку cryptolisting.
+# catalogId=161 — делістинги (рідкі), 48 — нові лістинги (часті, дають статистику швидко).
 SOURCES = [
-    {"name": "cms_composite", "poll": 5.0,
-     "url": "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
-            "?type=1&catalogId=161&pageNo=1&pageSize=20"},
-    {"name": "apex_fast", "poll": 0.5,
+    {"name": "cms_delist", "poll": 15.0,
      "url": "https://www.binance.com/bapi/apex/v1/public/apex/cms/article/list/query"
             "?type=1&catalogId=161&pageNo=1&pageSize=20"},
+    {"name": "cms_listing", "poll": 15.0,
+     "url": "https://www.binance.com/bapi/apex/v1/public/apex/cms/article/list/query"
+            "?type=1&catalogId=48&pageNo=1&pageSize=20"},
 ]
 
 
 def _articles(data):
+    """ВСІ статті (не лише делістинги): щоб було з чим зіставляти WS-події по титулу.
+    Делістингів мало, а міряти затримку джерела можна на будь-якому анонсі."""
     d = (data or {}).get("data") or {}
     arts = list(d.get("articles") or [])
     for c in d.get("catalogs", []) or []:
         arts += c.get("articles", []) or []
-    out = []
-    for a in arts:
-        t = a.get("title", "")
-        if "will delist" in t.lower():
-            out.append((str(a.get("id") or a.get("code") or t), t, a.get("releaseDate")))
-    return out
+    return [(str(a.get("id") or a.get("code") or a.get("title", "")),
+             a.get("title", ""), a.get("releaseDate")) for a in arts]
 
 
 def _log(rec):
@@ -113,15 +116,24 @@ async def watch_ws():
                             d = json.loads(msg.data)
                         except Exception:  # noqa: BLE001
                             continue
-                        if d.get("type") == "announcement" and \
-                                d.get("listingType") in ("spot_delisting", "futures_delisting"):
+                        # Логуємо ВСІ анонси, не лише делістинги: делістинги рідкі, а щоб
+                        # зміряти затримку самого джерела, згодиться будь-яка подія. Титул
+                        # потім зіставляємо зі статтею з CMS, щоб дістати releaseDate.
+                        if d.get("type") == "announcement":
                             now_ms = int(time.time() * 1000)
+                            det = d.get("detectedTimestampUs")
+                            disp = d.get("dispatchTimestampUs")
                             _log({"ts": dt.datetime.now(dt.timezone.utc).isoformat(),
                                   "source": "ws_cryptolisting", "title": d.get("title", ""),
                                   "ticker": d.get("ticker"), "listingType": d.get("listingType"),
-                                  "ws_detected_us": d.get("detectedTimestampUs"),
-                                  "ws_dispatch_us": d.get("dispatchTimestampUs"),
-                                  "detected_ms": now_ms, "release_ms": None, "latency_sec": None})
+                                  "ws_detected_us": det, "ws_dispatch_us": disp,
+                                  # їх детект→відправка, і відправка→ми: два плеча окремо
+                                  "their_hold_ms": round((disp - det) / 1000, 1)
+                                  if (det and disp) else None,
+                                  "transport_ms": round(now_ms - disp / 1000, 1)
+                                  if disp else None,
+                                  "detected_ms": now_ms, "release_ms": None,
+                                  "latency_sec": None})
         except Exception as e:  # noqa: BLE001
             print("ws: помилка", type(e).__name__, str(e)[:120], flush=True)
         await asyncio.sleep(5)
