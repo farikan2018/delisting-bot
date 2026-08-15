@@ -163,5 +163,56 @@ check("той самий тикер — дубль джерела",
 check("другий тикер дозволено", executor._reserve("BBB", "BBB/USDT:USDT") == "")
 check("третій — ліміт", executor._reserve("CCC", "CCC/USDT:USDT") == "max_concurrent")
 
+# ---------- 8) усиновлення осиротілої позиції ----------
+print("\n8) Ордер відповів помилкою — але позиція на біржі МОЖЕ бути відкрита")
+
+
+class _Dec:
+    ref_price, dropped_pct = 1.0, 0.0
+
+
+exchange.set_position_stop = _fake_set_stop
+CALLS["sent"].clear()
+
+before = storage.open_positions_count()
+exchange.position_size = lambda v, s: 0.0            # ордер справді не пройшов
+asyncio.run(executor._adopt_orphan("ORP", "bybit", "ORP/USDT:USDT", 1.0, 3.0, 1.0,
+                                   _Dec(), "RequestTimeout"))
+check("позиції нема → нічого не заводимо", storage.open_positions_count() == before)
+
+CALLS["sent"].clear()
+exchange.position_size = lambda v, s: None           # не змогли перевірити
+asyncio.run(executor._adopt_orphan("ORP", "bybit", "ORP/USDT:USDT", 1.0, 3.0, 1.0,
+                                   _Dec(), "RequestTimeout"))
+check("None → запис НЕ створюємо", storage.open_positions_count() == before)
+check("None → гучне попередження користувачу",
+      any("ВРУЧНУ" in t for t in CALLS["sent"]), f"надіслано={len(CALLS['sent'])}")
+
+CALLS["sent"].clear()
+CALLS["set_stop"].clear()
+executor._open_symbols.clear()
+exchange.position_size = lambda v, s: 12.0           # позиція ВІДКРИТА попри помилку
+asyncio.run(executor._adopt_orphan("ORP", "bybit", "ORP/USDT:USDT", 1.0, 3.0, 1.0,
+                                   _Dec(), "RequestTimeout"))
+check("позиція є → взято під облік", storage.open_positions_count() == before + 1)
+check("розмір узято З БІРЖІ, не з нашої оцінки",
+      any(p["contracts"] == 12.0 for p in storage.get_open_positions()))
+check("символ повернуто в памʼять дедупу",
+      "ORP/USDT:USDT" in executor._open_symbols)
+check("стоп повішено", len(CALLS["set_stop"]) == 1)
+check("користувача попереджено", any("ВІДКРИТА" in t for t in CALLS["sent"]))
+
+# ---------- 9) подвійне закриття ----------
+print("\n9) Монітор і звірка не можуть закрити одну позицію двічі")
+orp = next(p for p in storage.get_open_positions() if p["ticker"] == "ORP")
+executor._closing.add(orp["id"])
+n_before = storage.open_positions_count()
+asyncio.run(executor._do_close(orp, 1.0, "MANUAL"))
+check("закриття «в дорозі» ігнорується", storage.open_positions_count() == n_before)
+executor._closing.discard(orp["id"])
+asyncio.run(executor._do_close(orp, 1.0, "MANUAL", already_closed=True))
+check("після зняття замка закривається", storage.open_positions_count() == n_before - 1)
+check("замок звільнено", orp["id"] not in executor._closing)
+
 print("\n" + ("ВСІ ТЕСТИ ПРОЙШЛИ" if not FAILS else f"ПРОВАЛЕНО: {FAILS}"))
 sys.exit(1 if FAILS else 0)

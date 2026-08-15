@@ -31,6 +31,11 @@ def _new_client(venue: str, rate_limit: bool) -> "ccxt.Exchange":
             "apiKey": key,
             "secret": sec,
             "enableRateLimit": rate_limit,
+            # Явний таймаут замість дефолтних 10с ccxt. Бойовий клієнт чекає менше:
+            # ордер, який не відповів за 5с, усе одно вже поза стратегією (ринок
+            # рухається на 1.5-3с), а от зайві 5с очікування — це 5с, протягом яких
+            # ми не знаємо, чи висить на біржі позиція.
+            "timeout": config.ORDER_TIMEOUT_MS if not rate_limit else config.HTTP_TIMEOUT_MS,
             "options": {"defaultType": "swap"},
         }
     )

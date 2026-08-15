@@ -39,7 +39,14 @@ import logbook as log
 import storage
 
 # НЕкешовані хости (перевірено: X-Cache=Miss завжди, Age відсутній).
-HOSTS = ["accounts.binance.com", "p2p.binance.com", "launchpad.binance.com"]
+# Некешовані хости того самого CMS-ендпоінта. Порядок = пріоритет: перші три
+# заміряно найшвидшими, academy додано 2026-08-15 четвертим (віддає ті самі 20
+# статей, Age відсутній, але RTT бімодальний ~80/220мс). Четвертий хост потрібен
+# не заради його швидкості, а щоб СКОРОТИТИ ПАУЗУ між опитуваннями: детект — це
+# мінімум по всіх хостах, тож зайвий опит лише зменшує очікування.
+# Перевірено стійкий темп 13 зап/с з дата-центрового IP — усі 200, без 429.
+HOSTS = ["accounts.binance.com", "p2p.binance.com", "launchpad.binance.com",
+         "academy.binance.com"]
 _PATH = ("/bapi/apex/v1/public/apex/cms/article/list/query"
          "?type=1&catalogId=161&pageNo=1&pageSize=20")
 _HDRS = {

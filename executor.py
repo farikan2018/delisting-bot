@@ -29,6 +29,7 @@ _entry_fee: dict = {}
 _claimed: set = set()       # тикери, по яких заявку вже взято в цьому процесі
 _open_symbols: set = set()  # символи з відкритою позицією (люстро БД у памʼяті)
 _reserved: int = 0          # відкриттів «у дорозі» — щоб не пробити MAX_CONCURRENT
+_closing: set = set()       # pos_id, які вже закриваються (monitor vs reconcile)
 
 # --- Аварійний вимикач по денному збитку. У памʼяті, бо гарячий шлях не ходить у SQLite. ---
 _daily_pnl: float = 0.0     # реалізований PnL реальних угод за поточну добу UTC
@@ -245,13 +246,15 @@ async def open_from_signal(ticker: str, detect_latency=None, real=None, margin=N
                                                 config.LEVERAGE)
                         order = await asyncio.to_thread(exchange.open_short, venue, symbol,
                                                         contracts)
-                    except Exception:  # noqa: BLE001
+                    except Exception as e2:  # noqa: BLE001
                         log.exception(f"open_short повторно впав {ticker} {venue}")
-                        fire(tg.send_message(f"❌ <b>{ticker}</b>: помилка ордера ({venue})."))
+                        fire(_adopt_orphan(ticker, venue, symbol, entry_price, margin,
+                                           contract_size, decision, str(e2)))
                         return
                 else:
                     log.exception(f"open_short помилка {ticker} {venue}")
-                    fire(tg.send_message(f"❌ <b>{ticker}</b>: помилка ордера ({venue})."))
+                    fire(_adopt_orphan(ticker, venue, symbol, entry_price, margin,
+                                       contract_size, decision, str(e)))
                     return
             order_ms = round((time.perf_counter() - t_ord) * 1000)
 
@@ -263,7 +266,16 @@ async def open_from_signal(ticker: str, detect_latency=None, real=None, margin=N
             "ref_price": decision.ref_price, "entry_price": entry_price,
             "dropped_pct": decision.dropped_pct,
         }
-        pos_id = storage.insert_position(pos)
+        try:
+            pos_id = storage.insert_position(pos)
+        except Exception as e:  # noqa: BLE001
+            # Ордер уже долетів, а запис не став (БД заблокована / диск повний).
+            # Мовчки вийти не можна: на біржі висітиме позиція, якої нема в обліку.
+            log.exception(f"insert_position впав {ticker}")
+            if real:
+                fire(_adopt_orphan(ticker, venue, symbol, entry_price, margin,
+                                   contract_size, decision, f"insert_position: {e}"))
+            return
         opened = True
         log.event("open", pos_id=pos_id, ticker=ticker, venue=venue, symbol=symbol,
                   mode=mode, entry_price=entry_price, contracts=contracts,
@@ -278,6 +290,57 @@ async def open_from_signal(ticker: str, detect_latency=None, real=None, margin=N
     finally:
         if dedup:
             _release(ticker, symbol, opened)
+
+
+async def _adopt_orphan(ticker: str, venue: str, symbol: str, entry_price: float,
+                        margin: float, contract_size: float, decision, err: str) -> None:
+    """Ордер відповів помилкою — але це НЕ означає, що його не виконали.
+
+    Найгірший реальний сценарій: Bybit прийняв ринковий продаж, а відповідь
+    загубилась (ccxt кидає RequestTimeout). Тоді на біржі висить ГОЛА позиція,
+    якої нема в БД — а її не побачить ні monitor_once, ні reconcile_real, бо обидва
+    ходять лише по БД. Без цієї функції така позиція жила б до ліквідації, і єдиним
+    слідом було б повідомлення «помилка ордера», яке активно вводить в оману.
+
+    Тому: питаємо біржу, що там насправді, і якщо позиція є — беремо її під облік
+    і вішаємо стоп.
+    """
+    size = None
+    for _ in range(3):
+        size = await asyncio.to_thread(exchange.position_size, venue, symbol)
+        if size is not None:
+            break
+        await asyncio.sleep(1.0)
+
+    if size is None:  # None — це «не знаю», а не «нема». Мовчати тут не можна.
+        log.event("orphan_check_failed", ticker=ticker, symbol=symbol, venue=venue,
+                  err=err[:200])
+        await tg.send_message(
+            f"🚨 <b>{ticker}</b>: ордер впав, і перевірити позицію на {venue} НЕ вдалося.\n"
+            f"Помилка: <code>{err[:120]}</code>\n"
+            f"⚠️ ПЕРЕВІР <code>{symbol}</code> ВРУЧНУ на біржі!")
+        return
+
+    if size <= 0:  # ордер справді не пройшов — усе чисто
+        log.event("orphan_none", ticker=ticker, symbol=symbol, err=err[:200])
+        await tg.send_message(f"❌ <b>{ticker}</b>: помилка ордера ({venue}), "
+                              f"позиції на біржі нема — чисто.")
+        return
+
+    pos = {"ticker": ticker, "symbol": symbol, "venue": venue, "mode": "real",
+           "margin": margin, "leverage": config.LEVERAGE, "contracts": size,
+           "contract_size": contract_size, "ref_price": decision.ref_price,
+           "entry_price": entry_price, "dropped_pct": decision.dropped_pct}
+    pos_id = await asyncio.to_thread(storage.insert_position, pos)
+    _open_symbols.add(symbol)  # _release уже відпрацював із opened=False
+    log.event("orphan_adopted", pos_id=pos_id, ticker=ticker, symbol=symbol,
+              venue=venue, contracts=size, err=err[:200])
+    await tg.send_message(
+        f"🚨 <b>{ticker}</b>: ордер відповів помилкою, але позиція на {venue} "
+        f"ВІДКРИТА ({size:g} контр.).\nВзяв під облік #{pos_id}, вішаю стоп.")
+    if config.EXCHANGE_STOP:
+        await arm_exchange_stop(pos_id, venue, symbol, entry_price,
+                                config.LEVERAGE, ticker)
 
 
 async def _settle_and_arm(pos_id: int, pos: dict, order: dict) -> None:
@@ -458,7 +521,24 @@ async def _do_close(pos: dict, price: float, reason: str,
                     already_closed: bool = False) -> None:
     """already_closed=True — позиції на біржі вже НЕМА (спрацював біржовий SL/TP),
     тому ордер на закриття слати не можна: reduce-only без позиції буде відхилено,
-    а без reduce-only ми б відкрили нову позицію в протилежний бік."""
+    а без reduce-only ми б відкрили нову позицію в протилежний бік.
+
+    Закриття НЕ ідемпотентне саме по собі: monitor_once і reconcile_real — два
+    незалежні цикли, і між читанням позиції та її закриттям є await. Без замка
+    обидва встигли б послати ордер на закриття однієї позиції."""
+    pid = pos["id"]
+    if pid in _closing:
+        log.event("close_skipped_inflight", pos_id=pid, reason=reason)
+        return
+    _closing.add(pid)
+    try:
+        await _do_close_inner(pos, price, reason, already_closed)
+    finally:
+        _closing.discard(pid)
+
+
+async def _do_close_inner(pos: dict, price: float, reason: str,
+                          already_closed: bool = False) -> None:
     exit_price = price
     exit_fee = None
     if pos.get("mode") == "real" and not already_closed:
