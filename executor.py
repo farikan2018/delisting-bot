@@ -30,6 +30,38 @@ _claimed: set = set()       # тикери, по яких заявку вже в
 _open_symbols: set = set()  # символи з відкритою позицією (люстро БД у памʼяті)
 _reserved: int = 0          # відкриттів «у дорозі» — щоб не пробити MAX_CONCURRENT
 
+# --- Аварійний вимикач по денному збитку. У памʼяті, бо гарячий шлях не ходить у SQLite. ---
+_daily_pnl: float = 0.0     # реалізований PnL реальних угод за поточну добу UTC
+_daily_day: str = ""
+
+
+def init_daily() -> None:
+    """Старт процесу: підняти денний лічильник із БД. Рестарт посеред доби не має
+    обнуляти вже понесений збиток, інакше ліміт нічого не обмежує."""
+    global _daily_day, _daily_pnl
+    _daily_day = dt.datetime.utcnow().strftime("%Y-%m-%d")
+    _daily_pnl = storage.realized_pnl_today("real")
+
+
+def _roll_day() -> None:
+    """Перекидає лічильник на нову добу UTC. БЕЗ I/O — його кличе гарячий шлях.
+    Нова доба завжди починається з нуля, бо закритих угод у ній ще не було."""
+    global _daily_day, _daily_pnl
+    d = dt.datetime.utcnow().strftime("%Y-%m-%d")
+    if d != _daily_day:
+        _daily_day, _daily_pnl = d, 0.0
+
+
+def daily_pnl() -> float:
+    _roll_day()
+    return _daily_pnl
+
+
+def _kill_switch_hit() -> bool:
+    """True = денний ліміт збитку вичерпано, нових позицій не відкриваємо."""
+    lim = config.MAX_DAILY_LOSS_USDT
+    return lim > 0 and daily_pnl() <= -lim
+
 
 def resync_open() -> None:
     """Синхронізує памʼять із БД (старт процесу / після закриття)."""
@@ -95,6 +127,8 @@ _REASON_LABEL = {
     "TAKE_PROFIT": "📉 Тейк-профіт",
     "MAX_HOLD": "⏰ Ліміт часу",
     "MANUAL": "🔧 Ручне закриття",
+    "EXCH_SL": "🛑 Стоп-лос (біржовий)",
+    "EXCH_TP": "📉 Тейк-профіт (біржовий)",
 }
 
 
@@ -127,6 +161,29 @@ async def open_from_signal(ticker: str, detect_latency=None, real=None, margin=N
         fire(tg.send_message(f"ℹ️ <b>{ticker}</b>: нема перпа на {vs} — пропуск."))
         return
     venue, symbol, raw = meta["venue"], meta["symbol"], meta["raw_id"]
+
+    # 1b) СИНХРОННО: захист реальних грошей. Обидві перевірки читають ПАМʼЯТЬ
+    # (лічильник доби і кеш балансу з keep-alive) — 0 мережі, 0 SQLite.
+    if real:
+        if _kill_switch_hit():
+            log.event("skip", ticker=ticker, reason="daily_loss_limit",
+                      daily_pnl=round(daily_pnl(), 4), limit=config.MAX_DAILY_LOSS_USDT,
+                      source=source)
+            fire(tg.send_message(
+                f"🛑 <b>{ticker}</b>: пропуск — денний ліміт збитку вичерпано "
+                f"({daily_pnl():+.2f} USDT). Нових позицій не відкриваю."))
+            return
+        if config.BALANCE_GUARD:
+            free = exchange.cached_free_balance(venue)
+            # None = даних нема; на здогадці вхід НЕ блокуємо, бо пропущена подія
+            # дорожча за відхилений ордер.
+            if free is not None and free < margin * 1.1:
+                log.event("skip", ticker=ticker, reason="low_balance", free=round(free, 4),
+                          need=margin, venue=venue, source=source)
+                fire(tg.send_message(
+                    f"💸 <b>{ticker}</b>: пропуск — вільної маржі ${free:.2f}, "
+                    f"потрібно ${margin:g}."))
+                return
 
     # 2) СИНХРОННО: заявка (дедуп між джерелами + ліміт одночасних позицій).
     if dedup:
@@ -217,15 +274,26 @@ async def open_from_signal(ticker: str, detect_latency=None, real=None, margin=N
                   total_ms=round((time.perf_counter() - t_sig) * 1000, 1))
         fire(tg.send_message(_open_message(pos_id, pos)))
         if real and order is not None:  # реальний fill+комісія — уже поза критичним шляхом
-            fire(_settle_fill(pos_id, venue, symbol, order))
+            fire(_settle_and_arm(pos_id, pos, order))
     finally:
         if dedup:
             _release(ticker, symbol, opened)
 
 
-async def _settle_fill(pos_id: int, venue: str, symbol: str, order: dict) -> None:
+async def _settle_and_arm(pos_id: int, pos: dict, order: dict) -> None:
+    """Післяордерний хвіст: дізнатись реальний fill і повісити біржовий стоп.
+    Порядок важливий — стоп рахуємо від ЦІНИ ФАКТИЧНОГО ВИКОНАННЯ, а не від нашої
+    оцінки з кешу, інакше поріг поїде на величину проковзування."""
+    fill = await _settle_fill(pos_id, pos["venue"], pos["symbol"], order)
+    if config.EXCHANGE_STOP:
+        await arm_exchange_stop(pos_id, pos["venue"], pos["symbol"],
+                                fill or pos["entry_price"], pos["leverage"], pos["ticker"])
+
+
+async def _settle_fill(pos_id: int, venue: str, symbol: str, order: dict) -> float | None:
     """Довантажує реальну ціну виконання й комісію входу (окремий запит ПІСЛЯ ордера)
-    і виправляє ними запис у БД. Потрібно для чесного net-PnL і заміру слиппеджу."""
+    і виправляє ними запис у БД. Потрібно для чесного net-PnL і заміру слиппеджу.
+    Повертає фактичну ціну входу (або None)."""
     avg = order.get("average") or order.get("price")
     fee = (order.get("fee") or {}).get("cost")
     oid = order.get("id")
@@ -238,6 +306,67 @@ async def _settle_fill(pos_id: int, venue: str, symbol: str, order: dict) -> Non
     if avg:
         storage.update_entry_price(pos_id, float(avg))
     log.event("fill", pos_id=pos_id, symbol=symbol, fill_price=avg, fee=fee)
+    return float(avg) if avg else None
+
+
+async def arm_exchange_stop(pos_id: int, venue: str, symbol: str, entry: float,
+                            leverage: float, ticker: str) -> bool:
+    """Вішає SL і TP на позицію на боці біржі. Три спроби: мережевий збій — не привід
+    лишати реальні гроші без захисту.
+
+    Якщо всі спроби впали, позицію НЕ закриваємо: програмний стоп у monitor_once
+    живий і перевіряє раз на EXIT_CHECK_SEC. Закрити хорошу угоду через збій API —
+    гарантований збиток проти малоймовірного; краще гучно попередити."""
+    sl = entry * (1 + config.STOP_LOSS_MARGIN_PCT / leverage / 100)   # шорт: стоп ВИЩЕ входу
+    tp = entry * (1 - config.TAKE_PROFIT_MARGIN_PCT / leverage / 100)  # тейк НИЖЧЕ входу
+
+    # Спершу пробуємо повісити обидва одним запитом, тоді — САМ СТОП.
+    # Чому потрібен фолбек: Bybit валідує тейк проти поточної ціни, а ми входимо
+    # рівно в обвал. Якщо за ті мілісекунди, що минули від філа, ціна встигла
+    # провалитись нижче нашого тейка, біржа відхилить ЗАПИТ ЦІЛКОМ — і разом із
+    # непотрібним уже тейком ми втратили б і стоп, тобто єдиний реальний захист.
+    for label, kw in (("sl+tp", {"stop_price": sl, "take_price": tp}),
+                      ("sl", {"stop_price": sl})):
+        for attempt in (1, 2, 3):
+            try:
+                await asyncio.to_thread(exchange.set_position_stop, venue, symbol, **kw)
+                log.event("stop_armed", pos_id=pos_id, symbol=symbol, venue=venue,
+                          entry=entry, sl_price=sl,
+                          tp_price=tp if "take_price" in kw else None,
+                          armed=label, attempt=attempt)
+                if label == "sl":  # тейк не став — його добере програмний монітор
+                    fire(tg.send_message(
+                        f"ℹ️ <b>{ticker}</b> #{pos_id}: біржовий стоп поставлено, "
+                        f"а тейк ні (ціна вже нижче нього). Тейк відпрацює бот."))
+                return True
+            except NotImplementedError:
+                # MEXC/Gate — біржового стопу поки нема. Це відомий стан, не аварія:
+                # лишається програмний стоп. Спамити попередженнями не треба.
+                log.event("stop_arm_unsupported", pos_id=pos_id, venue=venue, symbol=symbol)
+                return False
+            except Exception as e:  # noqa: BLE001
+                log.event("stop_arm_failed", pos_id=pos_id, symbol=symbol, mode=label,
+                          attempt=attempt, err=f"{type(e).__name__}: {e}"[:200])
+                if attempt < 3:
+                    await asyncio.sleep(1.0 * attempt)
+    fire(tg.send_message(
+        f"⚠️ <b>{ticker}</b> #{pos_id}: НЕ вдалось повісити стоп на біржі після 6 спроб.\n"
+        f"Позиція жива, захищена лише програмним стопом (потребує живого бота).\n"
+        f"Перевір вручну на Bybit!"))
+    return False
+
+
+async def rearm_open_stops() -> None:
+    """Старт процесу: переконатись, що на кожній реальній позиції висить біржовий стоп.
+    Сценарій, заради якого це існує: бот упав між ордером і встановленням стопа —
+    після рестарту позиція була б голою, і ніхто б про це не дізнався."""
+    if not config.EXCHANGE_STOP:
+        return
+    for pos in storage.get_open_positions():
+        if pos.get("mode") != "real":
+            continue
+        await arm_exchange_stop(pos["id"], pos["venue"], pos["symbol"],
+                                pos["entry_price"], pos["leverage"], pos["ticker"])
 
 
 def _open_message(pos_id: int, p: dict) -> str:
@@ -303,10 +432,36 @@ async def force_close(pos_id: int, reason: str = "MANUAL") -> bool:
     return False
 
 
-async def _do_close(pos: dict, price: float, reason: str) -> None:
+async def reconcile_real() -> None:
+    """Звірка з біржею для РЕАЛЬНИХ позицій.
+
+    Навіщо: тепер SL/TP висять на боці Bybit, тож позиція може закритись БЕЗ нашої
+    участі. У БД вона при цьому лишиться відкритою — слот із MAX_CONCURRENT буде
+    зайнятий назавжди, monitor даремно довбатиме ціну, а PnL ніколи не запишеться.
+    """
+    for pos in storage.get_open_positions():
+        if pos.get("mode") != "real":
+            continue
+        size = await asyncio.to_thread(exchange.position_size, pos["venue"], pos["symbol"])
+        if size is None or size > 0:
+            continue  # None = запит не вдався; на цьому висновків не робимо
+        price = await current_price(pos) or pos["entry_price"]
+        # Хто саме спрацював — визначаємо за напрямком ціни. Точну ціну виконання
+        # біржового стопа ми не бачимо, тому exit_price тут ПРИБЛИЗНИЙ.
+        reason = "EXCH_TP" if price < pos["entry_price"] else "EXCH_SL"
+        log.event("reconcile_closed", pos_id=pos["id"], symbol=pos["symbol"],
+                  reason=reason, approx_price=price)
+        await _do_close(pos, price, reason, already_closed=True)
+
+
+async def _do_close(pos: dict, price: float, reason: str,
+                    already_closed: bool = False) -> None:
+    """already_closed=True — позиції на біржі вже НЕМА (спрацював біржовий SL/TP),
+    тому ордер на закриття слати не можна: reduce-only без позиції буде відхилено,
+    а без reduce-only ми б відкрили нову позицію в протилежний бік."""
     exit_price = price
     exit_fee = None
-    if pos.get("mode") == "real":  # закриваємо реально лише РЕАЛЬНІ позиції (не глоб. DRY_RUN)
+    if pos.get("mode") == "real" and not already_closed:
         try:
             order = await asyncio.to_thread(
                 exchange.close_short, pos["venue"], pos["symbol"], pos["contracts"]
@@ -336,6 +491,10 @@ async def _do_close(pos: dict, price: float, reason: str) -> None:
     pnl_pct = pnl_usdt / pos["margin"] * 100 if pos.get("margin") else 0.0
     storage.close_position(pos["id"], exit_price, reason, pnl_usdt, pnl_pct)
     forget(pos["ticker"], pos["symbol"])  # токен знову доступний для наступного сигналу
+    if pos.get("mode") == "real":  # живлення аварійного вимикача
+        global _daily_pnl
+        _roll_day()
+        _daily_pnl += pnl_usdt
     log.event("close", pos_id=pos["id"], ticker=pos["ticker"], symbol=pos["symbol"],
               mode=pos.get("mode"), reason=reason, entry_price=pos["entry_price"],
               exit_price=exit_price, min_price=pos["min_price"],
@@ -350,11 +509,14 @@ def _close_message(p: dict, exit_price: float, reason: str,
     emoji = "✅" if pnl_usdt >= 0 else "🔻"
     dur = _duration(p.get("opened_at"))
     fee_line = f"Комісії: −{fees:.4f} USDT\n" if fees else ""
+    # Біржовий стоп спрацював без нас, точної ціни виконання ми не бачили —
+    # чесно позначаємо, що PnL приблизний, щоб не приймати його за факт.
+    approx = " (≈)" if reason in ("EXCH_SL", "EXCH_TP") else ""
     return (
         f"{emoji} <b>ЗАКРИТО ШОРТ</b> [{tag}] #{p['id']}\n"
         f"Монета: <b>{p['ticker']}</b> (<code>{p['symbol']}</code>)\n"
         f"Причина: <b>{_REASON_LABEL.get(reason, reason)}</b>\n"
-        f"Вхід: {_fmt(p['entry_price'])} → Вихід: {_fmt(exit_price)}\n"
+        f"Вхід: {_fmt(p['entry_price'])} → Вихід{approx}: {_fmt(exit_price)}\n"
         f"{fee_line}"
         f"Прибуток (net): <b>{pnl_usdt:+.4f} USDT</b> ({pnl_pct:+.1f}% від маржі)\n"
         f"Тривалість: {dur}"

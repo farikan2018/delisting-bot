@@ -455,9 +455,23 @@ async def _monitor_loop() -> None:
         await asyncio.sleep(config.EXIT_CHECK_SEC)
 
 
+async def _reconcile_loop() -> None:
+    """Звірка з біржею: біржовий SL/TP може закрити позицію без нас, і тоді запис
+    у БД треба закрити самим — інакше слот MAX_CONCURRENT зайнятий назавжди."""
+    if config.DRY_RUN and not config.EXCHANGE_STOP:
+        return
+    while True:
+        await asyncio.sleep(config.RECONCILE_SEC)
+        try:
+            await executor.reconcile_real()
+        except Exception:  # noqa: BLE001
+            log.exception("reconcile помилка")
+
+
 async def main() -> None:
     storage.init()
     executor.resync_open()  # люстро відкритих позицій у памʼять (дедуп на гарячому шляху)
+    executor.init_daily()   # денний лічильник збитку — щоб рестарт не обнуляв ліміт
     # Пре-обчислення всього, що потрібно для входу: venue+symbol+raw_id+contract_size по
     # кожному тикеру. Тягне ccxt-markets — свідомо на СТАРТІ, а не на сигналі. Біржі
     # вантажимо паралельно: послідовно це 23с, коли бот ще нічого не чує.
@@ -494,6 +508,9 @@ async def main() -> None:
               margin=config.POSITION_MARGIN_USDT, leverage=config.LEVERAGE,
               tp=config.TAKE_PROFIT_MARGIN_PCT, sl=config.STOP_LOSS_MARGIN_PCT,
               max_hold_min=config.MAX_HOLD_MINUTES, poll=config.POLL_INTERVAL,
+              max_concurrent=config.MAX_CONCURRENT, exchange_stop=config.EXCHANGE_STOP,
+              daily_loss_limit=config.MAX_DAILY_LOSS_USDT,
+              daily_pnl=round(executor.daily_pnl(), 4),
               open_positions=storage.open_positions_count())
     if config.TELEGRAM_CHAT_ID:
         mode = "🧪 DRY-RUN (без реальних ордерів)" if config.DRY_RUN else "⚠️ РЕАЛЬНА ТОРГІВЛЯ"
@@ -506,17 +523,27 @@ async def main() -> None:
             f"Біржі: {' → '.join(config.VENUE_PRIORITY)}\n"
             + (f"⚠️ <b>НЕ піднялись: {', '.join(missing)}</b> — перевір ключі "
                f"та IP-привʼязку!\n" if missing else "")
-            + f"Маржа ${config.POSITION_MARGIN_USDT:g} × {config.LEVERAGE:g}x\n"
-            f"Відкритих позицій: {open_n}"
+            + f"Маржа ${config.POSITION_MARGIN_USDT:g} × {config.LEVERAGE:g}x "
+            f"(до {config.MAX_CONCURRENT} позицій)\n"
+            f"Вихід: TP +{config.TAKE_PROFIT_MARGIN_PCT:g}% / SL −{config.STOP_LOSS_MARGIN_PCT:g}% "
+            f"маржі, макс {config.MAX_HOLD_MINUTES:g} хв\n"
+            + ("🛡 Стоп дублюється на біржі\n" if config.EXCHANGE_STOP and not config.DRY_RUN
+               else "")
+            + (f"🛑 Денний ліміт збитку: ${config.MAX_DAILY_LOSS_USDT:g}\n"
+               if config.MAX_DAILY_LOSS_USDT > 0 else "")
+            + f"Відкритих позицій: {open_n}"
         )
     else:
         print("[!] TELEGRAM_CHAT_ID не заданий — сповіщення підуть у консоль. "
               "Запусти get_chat_id.py, щоб його дізнатися.")
     # WS-тригер, поллінг-сторож, monitor, keep-alive, price-cache, Telegram-команди,
     # пре-озброєння плеча і монітор лагу лупу — паралельно.
+    # Реальні позиції могли лишитись від попереднього запуску — переконуємось, що
+    # на них висить біржовий стоп (бот міг упасти рівно між ордером і стопом).
+    await executor.rearm_open_stops()
     await asyncio.gather(fastcms.run(), _ws_loop(), _watch_loop(), _monitor_loop(),
                          _keepalive_loop(), pricecache.run(), pricecache.ws_run(),
-                         _command_loop(), _arm_leverage_loop(),
+                         _command_loop(), _arm_leverage_loop(), _reconcile_loop(),
                          _daily_report_loop(), runtime.loop_lag_monitor())
 
 

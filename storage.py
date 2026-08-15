@@ -102,6 +102,19 @@ def meta_set(key: str, value: str) -> None:
         db.commit()
 
 
+def realized_pnl_today(mode: str = "real") -> float:
+    """Сумарний реалізований PnL закритих угод за поточну добу UTC.
+    Потрібен, щоб аварійний вимикач пережив рестарт: інакше після перезапуску
+    лічильник збитку обнулявся б і денний ліміт нічого не обмежував."""
+    with _conn() as db:
+        row = db.execute(
+            "SELECT COALESCE(SUM(pnl_usdt), 0) FROM positions "
+            "WHERE status = 'closed' AND mode = ? AND date(closed_at) = date('now')",
+            (mode,),
+        ).fetchone()
+    return float(row[0] or 0.0)
+
+
 def seen_ids(limit: int = 5000) -> list[str]:
     """Останні бачені id — для памʼятного дедупу fastcms (щоб гарячий шлях не ходив у SQLite)."""
     with _conn() as db:

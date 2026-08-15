@@ -5,6 +5,8 @@ resolve() шукає перший майданчик, де токен має а�
 Публічні методи (ціна, історія, наявність) працюють без ключів — тому dry-run
 не потребує API-ключів жодної біржі.
 """
+import time
+
 import ccxt
 
 import config
@@ -74,11 +76,78 @@ def warm_ping(venue: str) -> bool:
     key, _sec = _KEYS.get(venue, lambda: ("", ""))()
     if key:
         try:
-            trade_client(venue).fetch_balance()  # підписаний прогрів бойового конекта
+            # Підписаний прогрів бойового конекта. Заразом безкоштовно оновлюємо
+            # кеш вільної маржі: гарячий шлях мусить знати баланс, але не має права
+            # ходити по нього в мережу — тому бере його звідси, з памʼяті.
+            b = trade_client(venue).fetch_balance()
+            free = ((b.get("USDT") or {}).get("free"))
+            if free is not None:
+                _balance_cache[venue] = (float(free), time.time())
             ok = True
         except Exception:  # noqa: BLE001
             pass
     return ok
+
+
+# ---- Вільна маржа: кеш, щоб гарячий шлях не платив за мережу ----
+_balance_cache: dict[str, tuple[float, float]] = {}   # venue -> (free_usdt, ts)
+
+
+def cached_free_balance(venue: str, max_age: float = 180.0) -> float | None:
+    """Вільна USDT-маржа з останнього keep-alive. None = даних нема або застаріли;
+    None НЕ означає «нуль» — на ньому вхід не блокуємо, щоб не пропустити подію."""
+    v = _balance_cache.get(venue)
+    if not v or (time.time() - v[1]) > max_age:
+        return None
+    return v[0]
+
+
+def free_balance(venue: str) -> float | None:
+    """Свіжий запит балансу (не для гарячого шляху)."""
+    try:
+        b = client(venue).fetch_balance()
+        free = ((b.get("USDT") or {}).get("free"))
+        if free is None:
+            return None
+        _balance_cache[venue] = (float(free), time.time())
+        return float(free)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def position_size(venue: str, symbol: str) -> float | None:
+    """Фактичний розмір позиції на біржі, у контрактах.
+    ВАЖЛИВО: None (запит не вдався) — це НЕ те саме, що 0.0 (позиції нема).
+    Нулем ми закриваємо запис у БД, тому плутати їх не можна."""
+    try:
+        for p in client(venue).fetch_positions([symbol]):
+            if p.get("symbol") == symbol:
+                return abs(float(p.get("contracts") or 0))
+        return 0.0
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def set_position_stop(venue: str, symbol: str, stop_price: float | None = None,
+                      take_price: float | None = None) -> None:
+    """Вішає SL/TP на САМУ ПОЗИЦІЮ (Bybit trading-stop), а не окремим ордером.
+
+    Чому саме так: такий стоп живе на боці біржі — переживає падіння нашого процесу,
+    втрату мережі й рестарт машини. І зникає РАЗОМ із позицією, тому не лишає
+    осиротілого умовного ордера, який пізніше сам відкриє шорт на порожньому місці.
+    Кидає виняток при невдачі — рішення, що з цим робити, приймає викликач."""
+    if venue != "bybit":
+        raise NotImplementedError(f"біржовий стоп реалізовано лише для bybit, не {venue}")
+    c = trade_client(venue)
+    body = {"category": "linear", "symbol": c.market(symbol)["id"],
+            "tpslMode": "Full", "positionIdx": 0}
+    if stop_price:
+        body["stopLoss"] = c.price_to_precision(symbol, stop_price)
+        body["slTriggerBy"] = "LastPrice"
+    if take_price:
+        body["takeProfit"] = c.price_to_precision(symbol, take_price)
+        body["tpTriggerBy"] = "LastPrice"
+    c.private_post_v5_position_trading_stop(body)
 
 
 def order_fill(venue: str, symbol: str, order_id: str) -> tuple:
