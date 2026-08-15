@@ -442,7 +442,9 @@ async def _settle_fill(pos_id: int, venue: str, symbol: str, order: dict) -> flo
         storage.update_entry_price(pos_id, float(avg))
     else:
         # Не мовчимо: без реальної ціни входу PnL і слиппедж будуть оцінкою.
-        log.event("fill_unknown", pos_id=pos_id, symbol=symbol, order_id=oid)
+        # order.get("id"), а НЕ oid: цей рядок лишився від часів, коли id діставався
+        # тут же, а після виносу _fill_details змінна поїхала в іншу функцію.
+        log.event("fill_unknown", pos_id=pos_id, symbol=symbol, order_id=order.get("id"))
     log.event("fill", pos_id=pos_id, symbol=symbol, fill_price=avg, fee=fee)
     return float(avg) if avg else None
 

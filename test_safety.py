@@ -353,5 +353,31 @@ asyncio.run(executor.monitor_once())
 check("періодична звірка з БД усе одно відбувається", db_calls["n"] == 1)
 storage.get_open_positions = _real_get
 
+# ---------- 13) гілка «ціну входу дізнатись не вдалось» ----------
+print("\n13) Коли Bybit не встиг проіндексувати угоду — не падаємо")
+# Саме тут жив NameError: oid лишився від часів, коли id діставався в цій же
+# функції. Гілка виконується у ФОНОВІЙ задачі, тому fire() ковтав виняток, і
+# ані модульні тести, ані наскрізний прогін його не бачили.
+exchange.order_fill = lambda v, s, o: (None, None)
+ids3 = []
+pos3 = _mk_pos(ids3)
+try:
+    got = asyncio.run(executor._settle_fill(pos3["id"], "bybit", "X/USDT:USDT",
+                                            {"id": "ORD-1"}))
+    check("_settle_fill не падає без ціни виконання", True)
+    check("повертає None, а не вигадану ціну", got is None, str(got))
+except NameError as e:
+    check("_settle_fill не падає без ціни виконання", False, f"NameError: {e}")
+except Exception as e:
+    check("_settle_fill не падає без ціни виконання", False, f"{type(e).__name__}: {e}")
+
+# і зворотний бік: коли ціна Є, вона доїжджає в БД
+exchange.order_fill = lambda v, s, o: (1.2345, 0.004)
+pos4 = _mk_pos(ids3)
+got = asyncio.run(executor._settle_fill(pos4["id"], "bybit", "X/USDT:USDT", {"id": "ORD-2"}))
+check("реальна ціна виконання повертається", got == 1.2345, str(got))
+check("комісія входу збережена в БД",
+      storage.meta_get(f"entry_fee:{pos4['id']}") is not None)
+
 print("\n" + ("ВСІ ТЕСТИ ПРОЙШЛИ" if not FAILS else f"ПРОВАЛЕНО: {FAILS}"))
 sys.exit(1 if FAILS else 0)

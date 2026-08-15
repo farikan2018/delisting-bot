@@ -6,3 +6,4 @@ ccxt>=4.4
 orjson>=3.9
 # uvloop не збирається під Windows, а локальна розробка саме там — тому маркер.
 uvloop>=0.19; sys_platform != "win32"
+pyflakes>=3.0        # статична перевірка невизначених імен (test_lint.py)
