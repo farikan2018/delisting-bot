@@ -384,27 +384,40 @@ async def _settle_and_arm(pos_id: int, pos: dict, order: dict) -> None:
         await arm_exchange_stop(pos_id, venue, symbol, fill, pos["leverage"], pos["ticker"])
 
 
-async def _settle_fill(pos_id: int, venue: str, symbol: str, order: dict) -> float | None:
-    """Довантажує реальну ціну виконання й комісію входу (окремий запит ПІСЛЯ ордера)
-    і виправляє ними запис у БД. Потрібно для чесного net-PnL і заміру слиппеджу.
-    Повертає фактичну ціну входу (або None)."""
+async def _fill_details(venue: str, symbol: str, order: dict) -> tuple:
+    """(ціна виконання, комісія) ордера, з ретраями.
+
+    Bybit індексує угоду в історії не миттєво, тому одразу після ордера запит
+    часто повертає порожньо. Живий тест це й показав: закриття записалось із
+    `fees: 0.0`, хоча комісія була — тобто PnL систематично завищувався б на
+    ~0.4% маржі за угоду, і цим завищеним числом живився б аварійний вимикач."""
     avg = order.get("average") or order.get("price")
     fee = (order.get("fee") or {}).get("cost")
     oid = order.get("id")
-    # Bybit індексує угоду в історії не миттєво — одразу після ордера запит часто
-    # повертає порожньо. Тому кілька спроб із паузою; ми вже поза гарячим шляхом,
-    # і стоп на біржі на цей момент уже стоїть.
     if (avg is None or fee is None) and oid:
         for delay in (0.0, 0.5, 1.5):
             if delay:
                 await asyncio.sleep(delay)
             f_avg, f_fee = await asyncio.to_thread(exchange.order_fill, venue, symbol, oid)
-            avg = avg or f_avg
+            avg = avg if avg is not None else f_avg
             fee = fee if fee is not None else f_fee
-            if avg is not None:
+            if avg is not None and fee is not None:
                 break
+    return (float(avg) if avg else None, float(fee) if fee is not None else None)
+
+
+async def _settle_fill(pos_id: int, venue: str, symbol: str, order: dict) -> float | None:
+    """Довантажує реальну ціну виконання й комісію входу (окремий запит ПІСЛЯ ордера)
+    і виправляє ними запис у БД. Потрібно для чесного net-PnL і заміру слиппеджу.
+    Повертає фактичну ціну входу (або None)."""
+    # Ретраї безпечні: ми вже поза гарячим шляхом, і стоп на біржі вже стоїть.
+    avg, fee = await _fill_details(venue, symbol, order)
     if fee is not None:
         _entry_fee[pos_id] = fee
+        # Дублюємо в БД: памʼять процесу не переживає рестарт, а позиція живе до
+        # 20 хвилин. Без цього будь-який деплой посеред угоди губив комісію входу,
+        # і закриття записувало б завищений PnL.
+        await asyncio.to_thread(storage.meta_set, f"entry_fee:{pos_id}", repr(fee))
     if avg:
         storage.update_entry_price(pos_id, float(avg))
     else:
@@ -674,19 +687,22 @@ async def _do_close_inner(pos: dict, price: float, reason: str,
                     f"⚠️ Перевір позицію вручну на біржі! (далі мовчу, щоб не спамити)"
                 )
             return
-        avg = order.get("average") or order.get("price")
-        fee = (order.get("fee") or {}).get("cost")
-        oid = order.get("id")
-        if (avg is None or fee is None) and oid:
-            f_avg, f_fee = await asyncio.to_thread(
-                exchange.order_fill, pos["venue"], pos["symbol"], oid)
-            avg = avg or f_avg
-            fee = fee if fee is not None else f_fee
+        avg, fee = await _fill_details(pos["venue"], pos["symbol"], order)
         exit_price = avg or price
         exit_fee = fee
+        if fee is None:
+            log.event("exit_fee_unknown", pos_id=pos["id"], symbol=pos["symbol"])
 
     price_pnl = pos["contracts"] * pos["contract_size"] * (pos["entry_price"] - exit_price)
-    entry_fee = _entry_fee.pop(pos["id"], exit_fee)  # памʼять процесу; фолбек ~exit_fee
+    entry_fee = _entry_fee.pop(pos["id"], None)
+    if entry_fee is None:  # памʼять процесу порожня — тягнемо з БД (пережило рестарт)
+        saved = storage.meta_get(f"entry_fee:{pos['id']}")
+        try:
+            entry_fee = float(saved) if saved is not None else None
+        except ValueError:
+            entry_fee = None
+    if entry_fee is None:  # останній фолбек: комісія виходу ≈ комісія входу
+        entry_fee = exit_fee
     fees = (entry_fee or 0.0) + (exit_fee or 0.0)
     pnl_usdt = price_pnl - fees
     pnl_pct = pnl_usdt / pos["margin"] * 100 if pos.get("margin") else 0.0
