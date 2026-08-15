@@ -28,6 +28,9 @@ import executor  # noqa: E402
 import storage  # noqa: E402
 import telegram_client as tg  # noqa: E402
 
+# Зберігаємо СПРАВЖНЮ функцію до будь-яких підмін — інакше тест 8b перевіряв би стаб.
+_ORIG_SET_STOP = exchange.set_position_stop
+
 storage.init()
 
 FAILS = []
@@ -201,6 +204,47 @@ check("символ повернуто в памʼять дедупу",
       "ORP/USDT:USDT" in executor._open_symbols)
 check("стоп повішено", len(CALLS["set_stop"]) == 1)
 check("користувача попереджено", any("ВІДКРИТА" in t for t in CALLS["sent"]))
+
+# ---------- 8b) «not modified» — це успіх, а не збій ----------
+print("\n8b) Bybit 34040 not modified = стоп уже там, куди ставимо")
+CALLS["sent"].clear()
+CALLS["set_stop"].clear()
+
+
+# перевіряємо саме шар exchange: він має ковтати 34040 і не піднімати виняток
+class _C:
+    def market(self, s):
+        return {"id": "X"}
+
+    def price_to_precision(self, s, p):
+        return str(p)
+
+    def private_post_v5_position_trading_stop(self, body):
+        raise RuntimeError('bybit {"retCode":34040,"retMsg":"not modified"}')
+
+
+exchange.trade_client = lambda v: _C()
+exchange.set_position_stop = _ORIG_SET_STOP
+try:
+    exchange.set_position_stop("bybit", "X/USDT:USDT", 1.1, 0.9)
+    check("34040 не піднімає виняток", True)
+except Exception as e:
+    check("34040 не піднімає виняток", False, str(e)[:60])
+
+
+class _C2(_C):
+    def private_post_v5_position_trading_stop(self, body):
+        raise RuntimeError('bybit {"retCode":10001,"retMsg":"invalid"}')
+
+
+exchange.trade_client = lambda v: _C2()
+try:
+    exchange.set_position_stop("bybit", "X/USDT:USDT", 1.1, 0.9)
+    check("справжня помилка ВСЕ Ж піднімається", False)
+except Exception:
+    check("справжня помилка ВСЕ Ж піднімається", True)
+
+exchange.set_position_stop = _fake_set_stop
 
 # ---------- 9) подвійне закриття ----------
 print("\n9) Монітор і звірка не можуть закрити одну позицію двічі")

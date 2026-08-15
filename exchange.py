@@ -152,7 +152,17 @@ def set_position_stop(venue: str, symbol: str, stop_price: float | None = None,
     if take_price:
         body["takeProfit"] = c.price_to_precision(symbol, take_price)
         body["tpTriggerBy"] = "LastPrice"
-    c.private_post_v5_position_trading_stop(body)
+    try:
+        c.private_post_v5_position_trading_stop(body)
+    except Exception as e:  # noqa: BLE001
+        # 34040 «not modified» = стоп УЖЕ стоїть рівно там, куди ми його ставимо.
+        # Це успіх, а не збій: саме так відповідає біржа, коли rearm_open_stops
+        # переставляє стоп після рестарту бота. Без цієї гілки кожен перезапуск
+        # із відкритою позицією слав користувачу фальшиву тривогу «стоп не став».
+        msg = str(e).lower()
+        if "34040" in msg or "not modified" in msg:
+            return
+        raise
 
 
 def order_fill(venue: str, symbol: str, order_id: str) -> tuple:
