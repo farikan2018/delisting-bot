@@ -81,6 +81,12 @@ MAX_DAILY_LOSS_USDT = float(_ENV.get("MAX_DAILY_LOSS_USDT", "0") or "0")
 BALANCE_GUARD = (_ENV.get("BALANCE_GUARD", "1").strip() != "0")
 # Звірка з біржею: позиція могла закритись біржовим SL/TP, а в БД лишитись відкритою.
 RECONCILE_SEC = float(_ENV.get("RECONCILE_SEC", "30") or "30")
+# Скільки позиція має прожити, перш ніж звірка має право визнати її закритою.
+# Bybit показує щойно відкриту позицію в /v5/position/list не миттєво, тому без
+# цього вікна звірка закривала б запис ЖИВОЇ позиції — і створювала б сироту.
+RECONCILE_MIN_AGE_SEC = float(_ENV.get("RECONCILE_MIN_AGE_SEC", "60") or "60")
+# Скільки разів ПОСПІЛЬ біржа має показати «позиції нема», щоб ми повірили.
+RECONCILE_CONFIRMS = int(_ENV.get("RECONCILE_CONFIRMS", "2") or "2")
 # Таймаути ccxt. Дефолтні 10с надто довгі: ордер, який не відповів, міг УЖЕ бути
 # виконаний, і кожна зайва секунда — це секунда невідомості про реальну позицію.
 ORDER_TIMEOUT_MS = int(_ENV.get("ORDER_TIMEOUT_MS", "5000") or "5000")

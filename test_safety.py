@@ -137,14 +137,52 @@ def _acoro(v):
 
 
 exchange.close_short = lambda *a, **k: CALLS.__setitem__("close_short", CALLS["close_short"] + 1)
+exchange.closed_pnl = lambda v, s: {"exit_price": 0.9, "pnl": 0.3, "side": "Buy", "ts": 0}
 asyncio.run(executor.reconcile_real())
 check("None → позиція лишається відкритою",
       storage.open_positions_count() == 1, f"відкрито={storage.open_positions_count()}")
 
-exchange.position_size = lambda v, s: 0.0           # позиції на біржі справді нема
+# Щойно відкрита позиція: Bybit ще не показує її в /v5/position/list, і 0.0 тут
+# означає «не встиг проіндексувати», а не «закрито». Закривати заборонено.
+exchange.position_size = lambda v, s: 0.0
+config.RECONCILE_MIN_AGE_SEC = 3600
 asyncio.run(executor.reconcile_real())
-check("0.0 → запис у БД закрито", storage.open_positions_count() == 0)
+check("молода позиція + 0.0 → НЕ чіпаємо (захист від сироти)",
+      storage.open_positions_count() == 1)
+
+config.RECONCILE_MIN_AGE_SEC = 0
+config.RECONCILE_CONFIRMS = 2
+executor._flat_seen.clear()
+asyncio.run(executor.reconcile_real())
+check("перше 0.0 → ще не віримо (1 з 2 підтверджень)",
+      storage.open_positions_count() == 1)
+asyncio.run(executor.reconcile_real())
+check("друге 0.0 поспіль → запис закрито", storage.open_positions_count() == 0)
 check("ордер на закриття НЕ слався (позиції вже нема)", CALLS["close_short"] == 0)
+
+# Ціна виходу мусить прийти З БІРЖІ, а не з поточного ринку
+closed = [p for p in __import__("sqlite3").connect(config.DB_PATH)
+          .execute("SELECT exit_price, exit_reason FROM positions WHERE status='closed'"
+                   ).fetchall()]
+check("ціна виходу взята з closed-pnl біржі, не вгадана",
+      any(abs(r[0] - 0.9) < 1e-9 for r in closed), f"{closed}")
+
+# Один виняток не має обривати весь прохід
+ids2 = []
+_p1 = _mk_pos(ids2)
+_p2 = _mk_pos(ids2)
+
+
+def _raise_for_first(v, s):
+    raise RuntimeError("fetch_positions впав")
+
+
+exchange.position_size = _raise_for_first
+try:
+    asyncio.run(executor.reconcile_real())
+    check("виняток по одній позиції не валить прохід", True)
+except Exception as e:
+    check("виняток по одній позиції не валить прохід", False, str(e)[:60])
 
 # ---------- 6) баланс-гард ----------
 print("\n6) Баланс-гард")

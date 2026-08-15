@@ -133,6 +133,34 @@ def position_size(venue: str, symbol: str) -> float | None:
         return None
 
 
+def closed_pnl(venue: str, symbol: str) -> dict | None:
+    """Реальний результат ОСТАННЬОГО закриття позиції з боку біржі.
+
+    Потрібен, бо коли позицію закрив біржовий SL/TP, ми дізнаємось про це лише
+    на звірці — до 30с пізніше. Брати тодішню ринкову ціну за ціну виходу не можна:
+    після делістингового обвалу ціна за 30с ходить на відсотки, і «збиток» легко
+    записався б прибутком. А цим числом живиться аварійний вимикач.
+
+    Повертає {'exit_price', 'pnl', 'side', 'ts'} або None.
+    """
+    if venue != "bybit":
+        return None
+    try:
+        c = client(venue)
+        r = c.private_get_v5_position_closed_pnl(
+            {"category": "linear", "symbol": c.market(symbol)["id"], "limit": 5})
+        rows = ((r.get("result") or {}).get("list")) or []
+        if not rows:
+            return None
+        row = rows[0]  # біржа віддає від найновішого
+        return {"exit_price": float(row["avgExitPrice"]),
+                "pnl": float(row["closedPnl"]),
+                "side": row.get("side"),
+                "ts": int(row.get("updatedTime") or row.get("createdTime") or 0)}
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def set_position_stop(venue: str, symbol: str, stop_price: float | None = None,
                       take_price: float | None = None) -> None:
     """Вішає SL/TP на САМУ ПОЗИЦІЮ (Bybit trading-stop), а не окремим ордером.

@@ -408,8 +408,20 @@ async def _handle_command(text: str) -> None:
             await tg.send_message("Немає що закривати.")
         else:
             await tg.send_message(f"🛑 Закриваю ВСІ позиції ({len(rows)})…")
+            # Кожна позиція окремо: /panic — це аварійна кнопка, і одна помилка
+            # НЕ має лишати решту позицій відкритими без жодного повідомлення.
+            ok, bad = 0, []
             for p in rows:
-                await executor.force_close(p["id"], reason="MANUAL")
+                try:
+                    await executor.force_close(p["id"], reason="MANUAL")
+                    ok += 1
+                except Exception:  # noqa: BLE001
+                    log.exception(f"panic: не закрилась #{p['id']}")
+                    bad.append(f"#{p['id']} {p['ticker']}")
+            await tg.send_message(
+                f"🛑 Закрито {ok} з {len(rows)}."
+                + (f"\n⚠️ НЕ закрились: {', '.join(bad)} — перевір вручну на біржі!"
+                   if bad else ""))
     else:
         await tg.send_message("Невідома команда. /help")
 
@@ -453,6 +465,22 @@ async def _monitor_loop() -> None:
         except Exception:  # noqa: BLE001
             log.exception("monitor помилка")
         await asyncio.sleep(config.EXIT_CHECK_SEC)
+
+
+async def _supervise(factory, name: str, delay: float = 3.0) -> None:
+    """Тримає цикл живим. asyncio.gather без return_exceptions пробиває перший же
+    виняток нагору й кладе процес — а це може статись із відкритою реальною
+    позицією. Тут впалий цикл просто перезапускається, а факт падіння йде в лог."""
+    while True:
+        try:
+            await factory()
+            log.event("loop_exited", loop=name)  # штатний вихід (напр. WS вимкнено)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception(f"цикл {name} впав — перезапускаю через {delay:g}с")
+            await asyncio.sleep(delay)
 
 
 async def _reconcile_loop() -> None:
@@ -538,13 +566,27 @@ async def main() -> None:
               "Запусти get_chat_id.py, щоб його дізнатися.")
     # WS-тригер, поллінг-сторож, monitor, keep-alive, price-cache, Telegram-команди,
     # пре-озброєння плеча і монітор лагу лупу — паралельно.
-    # Реальні позиції могли лишитись від попереднього запуску — переконуємось, що
-    # на них висить біржовий стоп (бот міг упасти рівно між ордером і стопом).
-    await executor.rearm_open_stops()
-    await asyncio.gather(fastcms.run(), _ws_loop(), _watch_loop(), _monitor_loop(),
-                         _keepalive_loop(), pricecache.run(), pricecache.ws_run(),
-                         _command_loop(), _arm_leverage_loop(), _reconcile_loop(),
-                         _daily_report_loop(), runtime.loop_lag_monitor())
+    # Кожен цикл під наглядом: без цього перший же виняток у будь-якому з них
+    # пробивав би gather і клав ВЕСЬ процес — можливо, з відкритою реальною
+    # позицією. Перезапускати впалий цикл безпечніше, ніж падати цілком.
+    await asyncio.gather(
+        _supervise(fastcms.run, "fastcms"),
+        _supervise(_ws_loop, "ws"),
+        _supervise(_watch_loop, "watch"),
+        _supervise(_monitor_loop, "monitor"),
+        _supervise(_keepalive_loop, "keepalive"),
+        _supervise(pricecache.run, "pricecache"),
+        _supervise(pricecache.ws_run, "pricecache_ws"),
+        _supervise(_command_loop, "command"),
+        _supervise(_arm_leverage_loop, "arm_leverage"),
+        _supervise(_reconcile_loop, "reconcile"),
+        _supervise(_daily_report_loop, "daily_report"),
+        _supervise(runtime.loop_lag_monitor, "loop_lag"),
+        # Реальні позиції могли лишитись від попереднього запуску. Раніше це
+        # чекали ПЕРЕД gather — а якщо Bybit гальмує (часта причина рестарту),
+        # бот стояв глухий десятки секунд, не чуючи анонсів.
+        executor.rearm_open_stops(),
+    )
 
 
 if __name__ == "__main__":
