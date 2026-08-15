@@ -296,5 +296,62 @@ asyncio.run(executor._do_close(orp, 1.0, "MANUAL", already_closed=True))
 check("після зняття замка закривається", storage.open_positions_count() == n_before - 1)
 check("замок звільнено", orp["id"] not in executor._closing)
 
+# ---------- 10) заявка на тикер має TTL ----------
+print("\n10) Заявка на тикер не вічна — інакше токен неторгований до рестарту")
+import time as _t  # noqa: E402
+
+config.CLAIM_TTL_SEC = 900
+config.MAX_CONCURRENT = 2
+executor._claimed.clear()
+executor._open_symbols.clear()
+executor._reserved = 0
+executor._reserved_margin = 0.0
+check("перша заявка проходить", executor._reserve("ZZZ", "ZZZ/USDT:USDT") == "")
+executor._release("ZZZ", "ZZZ/USDT:USDT", False)   # вхід НЕ відбувся (спрацював фільтр)
+check("одразу після — дубль джерела відсічено",
+      executor._reserve("ZZZ", "ZZZ/USDT:USDT") == "duplicate_source")
+executor._claimed["ZZZ"] = _t.time() - 901          # TTL минув
+check("після TTL тикер знову торгований",
+      executor._reserve("ZZZ", "ZZZ/USDT:USDT") == "")
+
+# ---------- 11) баланс-гард бачить гроші «в дорозі» ----------
+print("\n11) Паралельні входи не витрачають одні й ті самі гроші двічі")
+executor._claimed.clear()
+executor._open_symbols.clear()
+executor._reserved = 0
+executor._reserved_margin = 0.0
+executor._reserve("AAA", "AAA/USDT:USDT", 3.0)
+check("маржа в дорозі врахована", executor._reserved_margin == 3.0)
+executor._reserve("BBB", "BBB/USDT:USDT", 3.0)
+check("двоє в дорозі → $6", executor._reserved_margin == 6.0)
+executor._release("AAA", "AAA/USDT:USDT", True, 3.0)
+check("після відкриття маржа знята з «у дорозі»", executor._reserved_margin == 3.0)
+executor._release("BBB", "BBB/USDT:USDT", False, 3.0)
+check("після провалу теж знята", executor._reserved_margin == 0.0)
+
+# ---------- 12) монітор не б'є диск, коли позицій нема ----------
+print("\n12) Монітор у спокої не читає БД і не пише в лог")
+executor._open_symbols.clear()
+executor._reserved = 0
+executor._last_db_sync = _t.time()          # щойно звірялись
+db_calls = {"n": 0}
+_real_get = storage.get_open_positions
+
+
+def _counting():
+    db_calls["n"] += 1
+    return _real_get()
+
+
+storage.get_open_positions = _counting
+asyncio.run(executor.monitor_once())
+asyncio.run(executor.monitor_once())
+check("два проходи в спокої → 0 звернень до SQLite", db_calls["n"] == 0,
+      f"звернень={db_calls['n']}")
+executor._last_db_sync = 0.0                # час звірки настав
+asyncio.run(executor.monitor_once())
+check("періодична звірка з БД усе одно відбувається", db_calls["n"] == 1)
+storage.get_open_positions = _real_get
+
 print("\n" + ("ВСІ ТЕСТИ ПРОЙШЛИ" if not FAILS else f"ПРОВАЛЕНО: {FAILS}"))
 sys.exit(1 if FAILS else 0)

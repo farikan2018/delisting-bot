@@ -26,12 +26,19 @@ _entry_fee: dict = {}
 # Джерел детекту кілька (Odin / WS-фід / швидкий поллінг / Telegram) і на одну подію
 # вони приходять із різницею мілісекунд. Якби перевірка «чи вже відкрито» йшла в БД
 # через await, обидва дубли встигли б її пройти й відкрити дві позиції на один токен.
-_claimed: set = set()       # тикери, по яких заявку вже взято в цьому процесі
+_claimed: dict = {}         # тикер -> час заявки (TTL, див. _reserve)
 _open_symbols: set = set()  # символи з відкритою позицією (люстро БД у памʼяті)
 _reserved: int = 0          # відкриттів «у дорозі» — щоб не пробити MAX_CONCURRENT
+_reserved_margin: float = 0.0  # маржа відкриттів «у дорозі» (баланс-гард)
 _closing: set = set()       # pos_id, які вже закриваються (monitor vs reconcile)
 _flat_seen: dict = {}       # pos_id -> скільки разів поспіль біржа показала «нема позиції»
 _close_alerted: set = set()  # pos_id, по яких уже кричали про невдале закриття
+
+# --- Стан монітора в памʼяті: щоб не бити диск щодві секунди (див. monitor_once) ---
+_min_price: dict = {}       # pos_id -> найнижча бачена ціна
+_min_saved: dict = {}       # pos_id -> коли востаннє зберегли мінімум у БД
+_tick_logged: dict = {}     # pos_id -> коли востаннє писали tick у лог
+_last_db_sync: float = 0.0
 
 # --- Аварійний вимикач по денному збитку. У памʼяті, бо гарячий шлях не ходить у SQLite. ---
 _daily_pnl: float = 0.0     # реалізований PnL реальних угод за поточну добу UTC
@@ -73,28 +80,35 @@ def resync_open() -> None:
         _open_symbols.add(p["symbol"])
 
 
-def _reserve(ticker: str, symbol: str) -> str:
+def _reserve(ticker: str, symbol: str, margin: float = 0.0) -> str:
     """Синхронна заявка на відкриття: '' = можна. КРИТИЧНО: між перевіркою і
     заявкою не має бути жодного await, інакше дедуп нічого не гарантує."""
-    global _reserved
-    if ticker in _claimed:
+    global _reserved, _reserved_margin
+    claimed_at = _claimed.get(ticker)
+    # Заявка з TTL. Її призначення — відсікти дублі ТІЄЇ САМОЇ події з чотирьох
+    # джерел, які приходять із різницею мілісекунд. Раніше вона жила вічно, тож
+    # тикер, по якому вхід не відбувся (спрацював фільтр, збій ордера), ставав
+    # неторгованим до рестарту — і мовчки: наступний делістинг того ж токена
+    # через місяць так само пропускався б.
+    if claimed_at is not None and (time.time() - claimed_at) < config.CLAIM_TTL_SEC:
         return "duplicate_source"
     if symbol in _open_symbols:
         return "already_open"
     if len(_open_symbols) + _reserved >= config.MAX_CONCURRENT:
         return "max_concurrent"
-    _claimed.add(ticker)
+    _claimed[ticker] = time.time()
     _reserved += 1
+    _reserved_margin += margin
     return ""
 
 
-def _release(ticker: str, symbol: str, opened: bool) -> None:
-    global _reserved
+def _release(ticker: str, symbol: str, opened: bool, margin: float = 0.0) -> None:
+    global _reserved, _reserved_margin
     _reserved = max(0, _reserved - 1)
+    _reserved_margin = max(0.0, _reserved_margin - margin)
     if opened:
         _open_symbols.add(symbol)
-    # _claimed НЕ знімаємо навмисно: якщо вхід не відбувся (фільтр або помилка ордера),
-    # дубль з іншого джерела тим паче не має пробувати ще раз по тій самій події.
+        _claimed[ticker] = time.time()  # поки позиція жива, дублі не потрібні
 
 
 def busy() -> bool:
@@ -108,7 +122,7 @@ def hot_state() -> dict:
 
 def forget(ticker: str, symbol: str) -> None:
     """Позиція закрита — знімаємо і заявку, і символ, щоб токен знову був доступний."""
-    _claimed.discard(ticker.upper())
+    _claimed.pop(ticker.upper(), None)
     _open_symbols.discard(symbol)
 
 
@@ -180,17 +194,23 @@ async def open_from_signal(ticker: str, detect_latency=None, real=None, margin=N
             free = exchange.cached_free_balance(venue)
             # None = даних нема; на здогадці вхід НЕ блокуємо, бо пропущена подія
             # дорожча за відхилений ордер.
-            if free is not None and free < margin * 1.1:
+            # Віднімаємо маржу відкриттів «у дорозі»: один анонс дає кілька токенів,
+            # вони летять ПАРАЛЕЛЬНО, і всі бачили б той самий знімок балансу —
+            # тобто кожен вважав би, що гроші вільні, хоча вони вже розписані.
+            if free is not None and (free - _reserved_margin) < margin * 1.1:
                 log.event("skip", ticker=ticker, reason="low_balance", free=round(free, 4),
-                          need=margin, venue=venue, source=source)
+                          in_flight=round(_reserved_margin, 4), need=margin,
+                          venue=venue, source=source)
                 fire(tg.send_message(
-                    f"💸 <b>{ticker}</b>: пропуск — вільної маржі ${free:.2f}, "
-                    f"потрібно ${margin:g}."))
+                    f"💸 <b>{ticker}</b>: пропуск — вільної маржі ${free:.2f}"
+                    + (f" (з них ${_reserved_margin:g} вже в дорозі)"
+                       if _reserved_margin else "")
+                    + f", потрібно ${margin:g}."))
                 return
 
     # 2) СИНХРОННО: заявка (дедуп між джерелами + ліміт одночасних позицій).
     if dedup:
-        why = _reserve(ticker, symbol)
+        why = _reserve(ticker, symbol, margin if real else 0.0)
         if why:
             log.event("skip", ticker=ticker, reason=why, source=source)
             if why != "duplicate_source":  # дубль джерела — нормальна робота, не спамимо
@@ -306,7 +326,7 @@ async def open_from_signal(ticker: str, detect_latency=None, real=None, margin=N
             fire(_settle_and_arm(pos_id, pos, order))
     finally:
         if dedup:
-            _release(ticker, symbol, opened)
+            _release(ticker, symbol, opened, margin if real else 0.0)
 
 
 async def _adopt_orphan(ticker: str, venue: str, symbol: str, entry_price: float,
@@ -530,8 +550,27 @@ async def current_price(pos: dict) -> float | None:
 
 
 async def monitor_once() -> None:
-    """Один прохід по всіх відкритих позиціях: оновити мінімум, перевірити вихід."""
+    """Один прохід по всіх відкритих позиціях: оновити мінімум, перевірити вихід.
+
+    Коли позицій нема (а це 99.9% часу), прохід не робить НІЧОГО: ні читання
+    SQLite, ні запису в лог. Раніше монітор щодві секунди ходив у базу й писав
+    рядок на кожну позицію — синхронні операції з диском просто в event-loop,
+    тобто рівно в тому лупі, який має бути вільним на момент сигналу.
+    Раз на MEMORY_RESYNC_SEC усе одно звіряємось із БД — щоб памʼять, яка з
+    якоїсь причини розійшлась із базою, не сховала позицію назавжди.
+    """
+    global _last_db_sync
+    now = time.time()
+    idle = not _open_symbols and _reserved == 0
+    if idle and (now - _last_db_sync) < 60.0:
+        return
+    _last_db_sync = now
+
     positions = storage.get_open_positions()
+    if idle and positions:  # памʼять розійшлась із БД — відновлюємо
+        log.event("monitor_resync", found=len(positions))
+        for p in positions:
+            _open_symbols.add(p["symbol"])
     for pos in positions:
         try:
             price = await current_price(pos)
@@ -546,14 +585,28 @@ async def monitor_once() -> None:
                     log.event("exit_no_price", pos_id=pos["id"], symbol=pos["symbol"])
                     await _do_close(pos, pos["entry_price"], "MAX_HOLD")
                 continue
-            if price < pos["min_price"]:
-                storage.update_min_price(pos["id"], price)
-                pos["min_price"] = price
+            pid = pos["id"]
+            # Мінімум тримаємо в памʼяті, у SQLite скидаємо рідко: це поле потрібне
+            # лише для звітності, а запис у базу на кожному тіку — це fsync у лупі.
+            mem_min = _min_price.get(pid)
+            if mem_min is None or mem_min > pos["min_price"]:
+                mem_min = pos["min_price"]
+            if price < mem_min:
+                mem_min = price
+            _min_price[pid] = mem_min
+            pos["min_price"] = mem_min
+            if now - _min_saved.get(pid, 0.0) >= config.MIN_PRICE_PERSIST_SEC:
+                _min_saved[pid] = now
+                storage.update_min_price(pid, mem_min)
+
             profit_pct = strategy.margin_profit_pct(pos["entry_price"], price, pos["leverage"])
-            log.event("tick", pos_id=pos["id"], symbol=pos["symbol"], price=price,
-                      min_price=pos["min_price"], profit_pct=round(profit_pct, 1))
+            if now - _tick_logged.get(pid, 0.0) >= config.TICK_LOG_SEC:
+                _tick_logged[pid] = now
+                log.event("tick", pos_id=pid, symbol=pos["symbol"], price=price,
+                          min_price=mem_min, profit_pct=round(profit_pct, 1))
             should_close, reason = strategy.check_exit(pos, price)
             if should_close:
+                storage.update_min_price(pid, mem_min)  # зафіксувати мінімум перед закриттям
                 await _do_close(pos, price, reason)
         except Exception:  # noqa: BLE001
             log.exception(f"monitor помилка по {pos.get('symbol')}")
@@ -709,7 +762,9 @@ async def _do_close_inner(pos: dict, price: float, reason: str,
     storage.close_position(pos["id"], exit_price, reason, pnl_usdt, pnl_pct)
     forget(pos["ticker"], pos["symbol"])  # токен знову доступний для наступного сигналу
     _close_alerted.discard(pos["id"])
-    _flat_seen.pop(pos["id"], None)
+    for d in (_flat_seen, _min_price, _min_saved, _tick_logged):
+        d.pop(pos["id"], None)
+    storage.meta_set(f"entry_fee:{pos['id']}", "")  # прибираємо за собою
     if pos.get("mode") == "real":  # живлення аварійного вимикача
         global _daily_pnl
         _roll_day()

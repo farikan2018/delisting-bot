@@ -91,6 +91,13 @@ RECONCILE_CONFIRMS = int(_ENV.get("RECONCILE_CONFIRMS", "2") or "2")
 # виконаний, і кожна зайва секунда — це секунда невідомості про реальну позицію.
 ORDER_TIMEOUT_MS = int(_ENV.get("ORDER_TIMEOUT_MS", "5000") or "5000")
 HTTP_TIMEOUT_MS = int(_ENV.get("HTTP_TIMEOUT_MS", "10000") or "10000")
+# Скільки живе заявка на тикер (дедуп між джерелами). Джерела приходять із різницею
+# мілісекунд, тому вистачає хвилин; вічна заявка робила б токен неторгованим назавжди.
+CLAIM_TTL_SEC = float(_ENV.get("CLAIM_TTL_SEC", "900") or "900")
+# Монітор: як часто писати tick у лог і зберігати мінімум ціни в SQLite. Обидва —
+# запис на диску в event-loop, і робити їх щодві секунди на кожну позицію марно.
+TICK_LOG_SEC = float(_ENV.get("TICK_LOG_SEC", "10") or "10")
+MIN_PRICE_PERSIST_SEC = float(_ENV.get("MIN_PRICE_PERSIST_SEC", "30") or "30")
 
 # Пре-озброєння плеча: виставити LEVERAGE по ВСІХ символах ЗАЗДАЛЕГІДЬ, щоб бойовий
 # ордер не платив +165мс за set_leverage (делістинг — це завжди «новий» символ).
