@@ -156,16 +156,53 @@ def set_position_stop(venue: str, symbol: str, stop_price: float | None = None,
 
 
 def order_fill(venue: str, symbol: str, order_id: str) -> tuple:
-    """Реальна середня ціна виконання + комісія ордера (avgPrice/fee) — для чесного
-    логування входу/виходу зі слиппеджем. Окремий запит ПІСЛЯ ордера (не на критичному
-    шляху виконання). Повертає (avg_price|None, fee_cost|None)."""
-    try:
-        o = client(venue).fetch_order(order_id, symbol)
+    """Реальна середня ціна виконання + комісія ордера — для чесного net-PnL і заміру
+    слиппеджу. Окремий запит ПІСЛЯ ордера (не на критичному шляху виконання).
+
+    Три джерела по черзі, бо `fetch_order` на Bybit для ВИКОНАНОГО ордера не працює:
+    /v5/order/realtime віддає лише активні, а заповнений одразу їде в історію.
+    Живий тест 2026-08-15 показав саме це — `fill_price: null, fee: null`.
+    Головним зробили `fetch_my_trades`: він єдиний коректно складає ЧАСТКОВІ філи
+    (зважена середня ціна + сума комісій), а ринковий ордер по неліквідному токену
+    під час обвалу — це майже завжди кілька філів.
+    """
+    c = client(venue)
+
+    def _from_trades():
+        trades = [t for t in c.fetch_my_trades(symbol, limit=20)
+                  if t.get("order") == order_id]
+        if not trades:
+            return (None, None)
+        qty = sum(float(t.get("amount") or 0) for t in trades)
+        if qty <= 0:
+            return (None, None)
+        avg = sum(float(t["price"]) * float(t["amount"]) for t in trades) / qty
+        fee = sum(float((t.get("fee") or {}).get("cost") or 0) for t in trades)
+        return (avg, fee)
+
+    def _from_closed():
+        for o in c.fetch_closed_orders(symbol, limit=20):
+            if o.get("id") == order_id:
+                avg = o.get("average") or o.get("price")
+                fee = (o.get("fee") or {}).get("cost")
+                return (float(avg) if avg else None,
+                        float(fee) if fee is not None else None)
+        return (None, None)
+
+    def _from_order():
+        o = c.fetch_order(order_id, symbol)
         avg = o.get("average") or o.get("price")
         fee = (o.get("fee") or {}).get("cost")
         return (float(avg) if avg else None, float(fee) if fee is not None else None)
-    except Exception:  # noqa: BLE001
-        return (None, None)
+
+    for src in (_from_trades, _from_closed, _from_order):
+        try:
+            avg, fee = src()
+            if avg:
+                return (avg, fee)
+        except Exception:  # noqa: BLE001
+            continue
+    return (None, None)
 
 
 def resolve(ticker: str) -> tuple[str | None, str | None]:

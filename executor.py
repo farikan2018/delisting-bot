@@ -344,13 +344,27 @@ async def _adopt_orphan(ticker: str, venue: str, symbol: str, entry_price: float
 
 
 async def _settle_and_arm(pos_id: int, pos: dict, order: dict) -> None:
-    """Післяордерний хвіст: дізнатись реальний fill і повісити біржовий стоп.
-    Порядок важливий — стоп рахуємо від ЦІНИ ФАКТИЧНОГО ВИКОНАННЯ, а не від нашої
-    оцінки з кешу, інакше поріг поїде на величину проковзування."""
-    fill = await _settle_fill(pos_id, pos["venue"], pos["symbol"], order)
+    """Післяордерний хвіст: стоп на біржу, тоді зʼясування реальної ціни виконання.
+
+    Порядок саме такий — ЗАХИСТ ПЕРЕД ТОЧНІСТЮ. Спокусливо спершу дізнатись фактичний
+    fill і повісити стоп рівно від нього, але зʼясування коштує 1-3 запити з паузами
+    (Bybit індексує угоду не миттєво), і всі ці секунди позиція стояла б гола.
+    Тому вішаємо від оцінки з кешу одразу, а коли фактична ціна приходить — за
+    потреби переставляємо. Оцінка з price-cache відрізняється від fill на частки
+    відсотка, тож проміжний стоп усе одно на своєму місці.
+    """
+    venue, symbol = pos["venue"], pos["symbol"]
+    est = pos["entry_price"]
     if config.EXCHANGE_STOP:
-        await arm_exchange_stop(pos_id, pos["venue"], pos["symbol"],
-                                fill or pos["entry_price"], pos["leverage"], pos["ticker"])
+        await arm_exchange_stop(pos_id, venue, symbol, est, pos["leverage"], pos["ticker"])
+
+    fill = await _settle_fill(pos_id, venue, symbol, order)
+
+    # Переставляємо, лише якщо проковзування реально зсунуло поріг.
+    if config.EXCHANGE_STOP and fill and abs(fill - est) / est > 0.0005:
+        log.event("stop_readjust", pos_id=pos_id, symbol=symbol, est=est, fill=fill,
+                  slip_pct=round((fill - est) / est * 100, 4))
+        await arm_exchange_stop(pos_id, venue, symbol, fill, pos["leverage"], pos["ticker"])
 
 
 async def _settle_fill(pos_id: int, venue: str, symbol: str, order: dict) -> float | None:
@@ -360,14 +374,25 @@ async def _settle_fill(pos_id: int, venue: str, symbol: str, order: dict) -> flo
     avg = order.get("average") or order.get("price")
     fee = (order.get("fee") or {}).get("cost")
     oid = order.get("id")
+    # Bybit індексує угоду в історії не миттєво — одразу після ордера запит часто
+    # повертає порожньо. Тому кілька спроб із паузою; ми вже поза гарячим шляхом,
+    # і стоп на біржі на цей момент уже стоїть.
     if (avg is None or fee is None) and oid:
-        f_avg, f_fee = await asyncio.to_thread(exchange.order_fill, venue, symbol, oid)
-        avg = avg or f_avg
-        fee = fee if fee is not None else f_fee
+        for delay in (0.0, 0.5, 1.5):
+            if delay:
+                await asyncio.sleep(delay)
+            f_avg, f_fee = await asyncio.to_thread(exchange.order_fill, venue, symbol, oid)
+            avg = avg or f_avg
+            fee = fee if fee is not None else f_fee
+            if avg is not None:
+                break
     if fee is not None:
         _entry_fee[pos_id] = fee
     if avg:
         storage.update_entry_price(pos_id, float(avg))
+    else:
+        # Не мовчимо: без реальної ціни входу PnL і слиппедж будуть оцінкою.
+        log.event("fill_unknown", pos_id=pos_id, symbol=symbol, order_id=oid)
     log.event("fill", pos_id=pos_id, symbol=symbol, fill_price=avg, fee=fee)
     return float(avg) if avg else None
 
