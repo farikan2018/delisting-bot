@@ -498,8 +498,11 @@ def _fast_triggers() -> list:
     out = []
     if config.CL_WS_KEY:
         out.append("ws")
-    if config.TG_API_ID and config.TG_API_HASH and config.TG_SESSION:
-        out.append("tg_feed")
+    # tg_feed СВІДОМО не рахується, попри наявні креди: петлі-читача в main.py
+    # ще немає (читач живе лише в probe.py). Рахувати його тут означало б знову
+    # звітувати конфіг замість живості — саме та помилка, через яку шість днів
+    # ніхто не бачив, що бот працює без швидкого тригера. Додати сюди рівно
+    # тоді, коли _tg_feed_loop зʼявиться у gather.
     return out
 
 
