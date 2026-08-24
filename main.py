@@ -593,7 +593,8 @@ async def main() -> None:
               daily_loss_limit=config.MAX_DAILY_LOSS_USDT,
               daily_pnl=round(executor.daily_pnl(), 4),
               open_positions=storage.open_positions_count(),
-              fast_triggers=_fast_triggers(), **_capabilities())
+              fast_triggers=_fast_triggers(),
+              tg_auth_ok=await tg.verify(), **_capabilities())
     if not _fast_triggers():
         log.event("degraded_detection", fast_triggers=[],
                   falls_back_to="fastcms_polling",
