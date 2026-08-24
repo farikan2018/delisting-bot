@@ -1,4 +1,9 @@
 # === Google Cloud (Ubuntu 22.04) — через браузерний SSH + GitHub ===
+
+> **НІКОЛИ не комітити справжні токени в цей файл.** Репозиторій публічний.
+> Токен, що лежав тут відкритим текстом, лишається у git-історії назавжди —
+> єдине справжнє лікування це відкликати його у @BotFather, а не переписати файл.
+
 #
 # Відкрий SSH до інстансу (кнопка SSH у Compute Engine → VM instances)
 # і встав ЦЕЙ блок повністю:
@@ -8,8 +13,8 @@
 # git clone https://github.com/farikan2018/delisting-bot.git ~/delisting-bot
 # cd ~/delisting-bot
 # cat > .env <<'EOF'
-# TELEGRAM_BOT_TOKEN=8694704608:AAEk7EXoMx5RwUaf_ScZRHW0rUK0Tv1f8k4
-# TELEGRAM_CHAT_ID=641324432
+# TELEGRAM_BOT_TOKEN=<ВСТАВ_СВІЙ_ТОКЕН>
+# TELEGRAM_CHAT_ID=<ВСТАВ_СВІЙ_CHAT_ID>
 # POLL_INTERVAL=3
 # EOF
 # bash deploy/setup.sh

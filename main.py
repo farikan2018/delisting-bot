@@ -467,14 +467,64 @@ async def _monitor_loop() -> None:
         await asyncio.sleep(config.EXIT_CHECK_SEC)
 
 
-async def _supervise(factory, name: str, delay: float = 3.0) -> None:
+def _capabilities() -> dict:
+    """Прапорці КОЖНОЇ можливості — у структуровану подію startup.
+
+    Причина існування: за тиждень ЧОТИРИ рази можливість тихо вимикалась через
+    відсутню змінну оточення (CL_WS_KEY, TG_*, TELEGRAM_BOT_TOKEN), і знімок
+    здоровʼя цього не показував. Бот шість днів торгував без швидкого тригера —
+    детект 15с замість 4с, тобто впʼятеро гірший результат на угоду — і жоден
+    лог не кричав. Тепер стан кожної можливості видно одним grep.
+    """
+    return {
+        "cap_fastcms": config.FASTCMS,
+        "cap_fastcms_trade": config.FASTCMS_TRADE,
+        "cap_ws": bool(config.CL_WS_KEY),
+        "cap_tg_feed": bool(config.TG_API_ID and config.TG_API_HASH
+                            and config.TG_SESSION),
+        "cap_tg_notify": bool(config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID),
+        "cap_bybit_keys": bool(config.BYBIT_API_KEY and config.BYBIT_API_SECRET),
+        "cap_pricecache_ws": config.PRICECACHE_WS,
+        "cap_dumpwatch": config.DUMPWATCH,
+        "cap_daily_report": config.DAILY_REPORT,
+        "cap_balance_guard": config.BALANCE_GUARD,
+        "cap_exchange_stop": config.EXCHANGE_STOP,
+    }
+
+
+def _fast_triggers() -> list:
+    """Швидкі тригери детекту. Поллінг сюди НЕ входить: він дає ~15с, а на
+    заміряній кривій це +5% на угоду проти +26% при вході за 1-2с."""
+    out = []
+    if config.CL_WS_KEY:
+        out.append("ws")
+    if config.TG_API_ID and config.TG_API_HASH and config.TG_SESSION:
+        out.append("tg_feed")
+    return out
+
+
+async def _supervise(factory, name: str, delay: float = 3.0,
+                     optional: bool = False) -> None:
     """Тримає цикл живим. asyncio.gather без return_exceptions пробиває перший же
     виняток нагору й кладе процес — а це може статись із відкритою реальною
     позицією. Тут впалий цикл просто перезапускається, а факт падіння йде в лог."""
     while True:
         try:
             await factory()
-            log.event("loop_exited", loop=name)  # штатний вихід (напр. WS вимкнено)
+            if optional:
+                log.event("loop_exited", loop=name, optional=True)
+            else:
+                # Штатний вихід НЕ-опційного циклу — це втрачена можливість,
+                # а не дрібниця. Рівно так зник WS-тригер: один рядок INFO,
+                # подія без алерту, і шість днів торгівлі на поллінгу.
+                log.event("loop_exited", loop=name, optional=False, alert=True)
+                log.error("ЦИКЛ " + name + " ЗАВЕРШИВСЯ — можливість втрачено")
+                try:
+                    await tg.send_message(
+                        "⚠️ Цикл <b>" + name + "</b> завершився штатно. "
+                        "Це втрата можливості — перевір конфіг.")
+                except Exception:  # noqa: BLE001
+                    pass
             return
         except asyncio.CancelledError:
             raise
@@ -539,7 +589,14 @@ async def main() -> None:
               max_concurrent=config.MAX_CONCURRENT, exchange_stop=config.EXCHANGE_STOP,
               daily_loss_limit=config.MAX_DAILY_LOSS_USDT,
               daily_pnl=round(executor.daily_pnl(), 4),
-              open_positions=storage.open_positions_count())
+              open_positions=storage.open_positions_count(),
+              fast_triggers=_fast_triggers(), **_capabilities())
+    if not _fast_triggers():
+        log.event("degraded_detection", fast_triggers=[],
+                  falls_back_to="fastcms_polling",
+                  measured_cost="детект ~15с замість ~4с: +5% замість +26% на угоду")
+        log.error("УВАГА: швидкого тригера НЕМА — лише поллінг (~15с). "
+                  "Перевір CL_WS_KEY або TG_API_ID+TG_API_HASH+TG_SESSION.")
     if config.TELEGRAM_CHAT_ID:
         mode = "🧪 DRY-RUN (без реальних ордерів)" if config.DRY_RUN else "⚠️ РЕАЛЬНА ТОРГІВЛЯ"
         trigger = "⚡ WebSocket (швидкий)" if config.CL_WS_KEY else "🐌 лише поллінг"
@@ -571,21 +628,25 @@ async def main() -> None:
     # позицією. Перезапускати впалий цикл безпечніше, ніж падати цілком.
     await asyncio.gather(
         _supervise(fastcms.run, "fastcms"),
-        _supervise(_ws_loop, "ws"),
+        _supervise(_ws_loop, "ws", optional=True),
         _supervise(_watch_loop, "watch"),
         _supervise(_monitor_loop, "monitor"),
         _supervise(_keepalive_loop, "keepalive"),
         _supervise(pricecache.run, "pricecache"),
         _supervise(pricecache.ws_run, "pricecache_ws"),
         _supervise(_command_loop, "command"),
-        _supervise(_arm_leverage_loop, "arm_leverage"),
+        _supervise(_arm_leverage_loop, "arm_leverage", optional=True),
         _supervise(_reconcile_loop, "reconcile"),
         _supervise(_daily_report_loop, "daily_report"),
         _supervise(runtime.loop_lag_monitor, "loop_lag"),
         # Реальні позиції могли лишитись від попереднього запуску. Раніше це
         # чекали ПЕРЕД gather — а якщо Bybit гальмує (часта причина рестарту),
         # бот стояв глухий десятки секунд, не чуючи анонсів.
-        executor.rearm_open_stops(),
+        # Під наглядом, як і решта. Раніше це був ЄДИНИЙ член gather без
+        # _supervise — і виняток тут кладе процес рівно тоді, коли є
+        # незакриті реальні позиції, бо саме для них ця функція й існує.
+        # optional=True: штатне завершення тут нормальне (одноразова дія).
+        _supervise(executor.rearm_open_stops, "rearm", optional=True),
     )
 
 

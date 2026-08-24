@@ -1,2 +1,9 @@
-* text=auto
+# Python і конфіги — завжди LF у репозиторії. Без цього файли, збережені з
+# Windows, приходять на сервер із CRLF, git бачить фантомні зміни, а робоча
+# тека продакшну виглядає "модифікованою" без жодної змістової правки.
+*.py text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
 *.sh text eol=lf
+*.service text eol=lf
+*.json text eol=lf
