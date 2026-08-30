@@ -30,6 +30,7 @@ import pricecache
 import runtime
 import storage
 import telegram_client as tg
+import tgfeed
 
 
 _LOOP = "asyncio"  # перезаписується в __main__ на "uvloop", якщо він доступний
@@ -85,6 +86,17 @@ async def _on_fastcms(ev: bw.DelistingEvent, latency, host: str) -> None:
         log.event("fastcms_stale_no_trade", tickers=ev.tickers, latency_sec=latency)
         return
     await _fire_tickers(ev.tickers, latency, f"fastcms:{host.split('.')[0]}")
+
+
+async def _on_tg_feed(tickers: list, age, source: str) -> None:
+    """Сигнал із @CLWfeed. Веде в ТОЙ САМИЙ _fire_tickers, що й fastcms:
+    дедуплікація вже є в executor через заявку на тикер (CLAIM_TTL_SEC), тож
+    повторне спрацювання того ж делістингу з поллінга через ~11с буде
+    відкинуте — і саме воно дасть нам парний замір затримки."""
+    executor.fire(tg.send_message(
+        "📡 <b>Телеграм-фід</b> (вік ~" + str(age) + "с)" + chr(10)
+        + "Тикери: " + ", ".join(tickers)))
+    await _fire_tickers(tickers, age, source)
 
 
 async def _watch_loop() -> None:
@@ -156,7 +168,17 @@ async def _handle_ws_delisting(d: dict) -> None:
     # Торгуємо лише повний спот-делістинг (як і раніше).
     if listing_type != "spot_delisting":
         return
-    await _fire_tickers(tickers, age, "ws_cryptolisting")
+    # age вище — це ЛИШЕ транспорт від їхньої відправки. Справжній вік сигналу
+    # більший на час, який їхня система витратила на сам детект (заміряно 2.28с
+    # на живому делістингу 20.08). Без цієї поправки ми (а) занижували б
+    # detect_latency у звітності, (б) не мали б воріт на застарілість, які є в
+    # поллінга — тобто після довгого реконекту зайшли б у вже відпрацьований дамп.
+    est_age = round(age + config.FEED_DETECT_LAG_SEC, 2) if age is not None else None
+    if est_age is not None and est_age > config.MAX_SIGNAL_AGE_SEC:
+        log.event("ws_stale_no_trade", tickers=tickers, est_age_sec=est_age,
+                  transport_sec=age, limit=config.MAX_SIGNAL_AGE_SEC)
+        return
+    await _fire_tickers(tickers, est_age, "ws_cryptolisting")
 
 
 async def _ws_loop() -> None:
@@ -498,11 +520,11 @@ def _fast_triggers() -> list:
     out = []
     if config.CL_WS_KEY:
         out.append("ws")
-    # tg_feed СВІДОМО не рахується, попри наявні креди: петлі-читача в main.py
-    # ще немає (читач живе лише в probe.py). Рахувати його тут означало б знову
-    # звітувати конфіг замість живості — саме та помилка, через яку шість днів
-    # ніхто не бачив, що бот працює без швидкого тригера. Додати сюди рівно
-    # тоді, коли _tg_feed_loop зʼявиться у gather.
+    # tg_feed рахується з 2026-08-24: петля tgfeed.run у gather, обробник
+    # зареєстрований. cap_tg_feed каже про КРЕДИ, а цей список — про реально
+    # підключений шлях; різницю між ними ми одного разу вже проґавили на шість днів.
+    if config.TG_API_ID and config.TG_API_HASH and config.TG_SESSION:
+        out.append("tg_feed")
     return out
 
 
@@ -582,6 +604,7 @@ async def main() -> None:
     # Дедуп анонсів живе в fastcms і спільний із поллінг-сторожем. Праймимо ДО gather:
     # інакше сторож на першому ж проході вважав би всі 20 наявних статей новими.
     fastcms.set_handler(_on_fastcms)
+    tgfeed.set_handler(_on_tg_feed)
     log.event("fastcms_primed", seen=fastcms.prime())
     gcinfo = runtime.tune_gc()
     log.event("runtime", loop=_LOOP, json=fastjson.NAME, **gcinfo)
@@ -632,6 +655,7 @@ async def main() -> None:
     # позицією. Перезапускати впалий цикл безпечніше, ніж падати цілком.
     await asyncio.gather(
         _supervise(fastcms.run, "fastcms"),
+        _supervise(tgfeed.run, "tg_feed", optional=True),
         _supervise(_ws_loop, "ws", optional=True),
         _supervise(_watch_loop, "watch"),
         _supervise(_monitor_loop, "monitor"),
