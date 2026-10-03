@@ -5,6 +5,7 @@ resolve() шукає перший майданчик, де токен має а�
 Публічні методи (ціна, історія, наявність) працюють без ключів — тому dry-run
 не потребує API-ключів жодної біржі.
 """
+import concurrent.futures as cf
 import time
 
 import ccxt
@@ -64,34 +65,66 @@ def trade_client(venue: str) -> "ccxt.Exchange":
     return _trade_clients[venue]
 
 
-def warm_ping(venue: str) -> bool:
-    """Тримає TLS-конект теплим, щоб перший ордер після простою не платив холодний
-    TLS-старт. Гріємо ОБА клієнти, і бойовий — підписаним викликом, бо саме його
-    конектом і auth-шляхом полетить create_order."""
-    ok = False
+def warm_ping(venue: str) -> dict:
+    """Тримає TLS-конекти теплими і ЧЕСНО звітує, що саме вдалося.
+
+    ЧОМУ ПОВЕРТАЄ dict, А НЕ bool (2026-10-03). Раніше функція ставила ok=True
+    одразу після ПУБЛІЧНОГО fetch_time, а підписаний виклик робила нижче в
+    try/except із голим pass. Публічний виклик проходить завжди — отже мертвий
+    ключ Bybit (протермінований або відвʼязаний від IP після 49 діб аптайму)
+    давав рівно той самий бадьорий `bybit:ok` у лозі. Наслідки були тихі й дорогі:
+    кеш вільної маржі переставав оновлюватись, BALANCE_GUARD вимикався сам собою,
+    а дізнались би ми про це лише на анонсі, коли create_order падає з auth.
+
+    ГРІЄМО КІЛЬКА КОНЕКТІВ. ccxt тримає один requests.Session на клієнта, і один
+    запит лишає в пулі рівно ОДНЕ тепле зʼєднання. Але анонс дає 1-6 токенів, і
+    всі вони летять ПАРАЛЕЛЬНО: другий і третій ордери відкривали б TCP+TLS із
+    нуля — сотні мілісекунд саме там, де кожна секунда коштує відсотків. Тому
+    підігріваємо MAX_CONCURRENT конектів одночасно, і робимо це ПУБЛІЧНИМ
+    fetch_time: той самий пул і той самі TLS, але без підпису — отже без
+    одночасних nonce на бойовому клієнті.
+    """
+    res = {"public_ok": False, "signed_ok": False, "free": None, "warmed": 0}
     try:
         c = client(venue)
         if c.has.get("fetchTime"):
             c.fetch_time()
         else:
             c.fetch_ticker("BTC/USDT:USDT")
-        ok = True
+        res["public_ok"] = True
     except Exception:  # noqa: BLE001
         pass
+
     key, _sec = _KEYS.get(venue, lambda: ("", ""))()
-    if key:
-        try:
-            # Підписаний прогрів бойового конекта. Заразом безкоштовно оновлюємо
-            # кеш вільної маржі: гарячий шлях мусить знати баланс, але не має права
-            # ходити по нього в мережу — тому бере його звідси, з памʼяті.
-            b = trade_client(venue).fetch_balance()
-            free = ((b.get("USDT") or {}).get("free"))
-            if free is not None:
-                _balance_cache[venue] = (float(free), time.time())
-            ok = True
-        except Exception:  # noqa: BLE001
-            pass
-    return ok
+    if not key:
+        return res
+    tc = trade_client(venue)
+    n = max(1, int(config.MAX_CONCURRENT))
+    if n > 1 and tc.has.get("fetchTime"):
+        with cf.ThreadPoolExecutor(max_workers=n) as pool:
+            for r in pool.map(lambda _i: _safe_fetch_time(tc), range(n)):
+                res["warmed"] += 1 if r else 0
+    try:
+        # Підписаний прогрів бойового конекта. Заразом безкоштовно оновлюємо
+        # кеш вільної маржі: гарячий шлях мусить знати баланс, але не має права
+        # ходити по нього в мережу — тому бере його звідси, з памʼяті.
+        b = tc.fetch_balance()
+        free = ((b.get("USDT") or {}).get("free"))
+        if free is not None:
+            _balance_cache[venue] = (float(free), time.time())
+            res["free"] = float(free)
+        res["signed_ok"] = True
+    except Exception as e:  # noqa: BLE001
+        res["err"] = f"{type(e).__name__}: {e}"[:160]
+    return res
+
+
+def _safe_fetch_time(c) -> bool:
+    try:
+        c.fetch_time()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ---- Вільна маржа: кеш, щоб гарячий шлях не платив за мережу ----

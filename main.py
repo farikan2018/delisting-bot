@@ -208,14 +208,38 @@ async def _keepalive_loop() -> None:
     # первинний прогрів (створює клієнтів + TLS-конекти)
     warmed = []
     for v in config.VENUE_PRIORITY:
-        ok = await asyncio.to_thread(exchange.warm_ping, v)
-        warmed.append(f"{v}:{'ok' if ok else 'fail'}")
+        r = await asyncio.to_thread(exchange.warm_ping, v)
+        warmed.append(v + ":" + ("ok" if r.get("public_ok") else "fail")
+                      + "/sig:" + ("ok" if r.get("signed_ok") else "fail"))
     log.event("keepalive_start", venues=warmed, interval_sec=config.KEEPALIVE_SEC)
+    # Підписаний виклик — єдине, що справді доводить живий ключ. Рахуємо невдачі
+    # поспіль: раніше результат warm_ping у циклі ВІДКИДАВСЯ зовсім, тож мертвий
+    # ключ не лишав по собі жодного сліду аж до самого анонсу.
+    sig_fail = {v: 0 for v in config.VENUE_PRIORITY}
     while True:
         await asyncio.sleep(config.KEEPALIVE_SEC)
         for v in config.VENUE_PRIORITY:
             try:
-                await asyncio.to_thread(exchange.warm_ping, v)
+                r = await asyncio.to_thread(exchange.warm_ping, v)
+                if not config.BYBIT_API_KEY and v == "bybit":
+                    pass
+                elif r.get("signed_ok"):
+                    if sig_fail[v] >= 3:
+                        await alerts.clear_alert("Ключ " + v + " не працює")
+                    sig_fail[v] = 0
+                else:
+                    sig_fail[v] += 1
+                    if sig_fail[v] in (3, 30, 300):
+                        log.event("keepalive_signed_failed", venue=v,
+                                  fails=sig_fail[v], err=r.get("err"))
+                        await alerts.raise_alert(
+                            "Ключ " + v + " не працює",
+                            "Підписаний виклик не проходить " + str(sig_fail[v])
+                            + " разів поспіль: " + str(r.get("err")) + chr(10)
+                            + "Публічні запити при цьому йдуть, тобто мережа ні до "
+                            + "чого — це ключ або привʼязка до IP." + chr(10)
+                            + "Наслідки: ордер на делістингу НЕ пройде, а "
+                            + "BALANCE_GUARD тихо вимкнений.")
             except Exception:  # noqa: BLE001
                 log.exception(f"keepalive помилка {v}")
             # Розводимо біржі в часі: підряд це 6 підписаних викликів, чий ccxt-парсинг

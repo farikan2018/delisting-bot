@@ -4,6 +4,7 @@ DRY_RUN=True: усе симулюється (реальні ціни, вірту
 DRY_RUN=False: реальні ринкові ордери на MEXC (ізольована маржа).
 """
 import asyncio
+import concurrent.futures as cf
 import datetime as dt
 import time
 
@@ -26,6 +27,27 @@ _entry_fee: dict = {}
 # Джерел детекту кілька (Odin / WS-фід / швидкий поллінг / Telegram) і на одну подію
 # вони приходять із різницею мілісекунд. Якби перевірка «чи вже відкрито» йшла в БД
 # через await, обидва дубли встигли б її пройти й відкрити дві позиції на один токен.
+# ОКРЕМИЙ ПУЛ ПІД ОРДЕРИ (2026-10-03). asyncio.to_thread іде в ДЕФОЛТНИЙ
+# executor, а в нього на цій машині min(32, 2+4) = 6 потоків — і в них же
+# сидять keepalive (підписаний fetch_balance до двох бірж), monitor
+# (fetch_ticker), reconcile (fetch_positions), фоновий арм плеча і запис у
+# SQLite. На анонсі з трьох токенів ордер міг стати в чергу за будь-яким із
+# них: ccxt-виклики тут блокуючі й тривають сотні мілісекунд, а таймаут
+# HTTP_TIMEOUT_MS — 10 секунд. На кривій входу (1-2с = +26%, 5с = +12.8%)
+# чекання в черзі за чужим запитом — це прямий мінус відсотків.
+# Пул рівно під кількість одночасних позицій плюс запас на закриття.
+_ORDER_POOL = cf.ThreadPoolExecutor(
+    max_workers=max(2, int(config.MAX_CONCURRENT) + 1),
+    thread_name_prefix="order")
+
+
+async def _order_thread(fn, *args):
+    """Те саме, що asyncio.to_thread, але у ВИДІЛЕНОМУ пулі: гарячий шлях не
+    має конкурувати за потік із фоновою рутиною."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_ORDER_POOL, fn, *args)
+
+
 _claimed: dict = {}         # тикер -> час заявки (TTL, див. _reserve)
 _open_symbols: set = set()  # символи з відкритою позицією (люстро БД у памʼяті)
 _reserved: int = 0          # відкриттів «у дорозі» — щоб не пробити MAX_CONCURRENT
@@ -301,21 +323,21 @@ async def open_from_signal(ticker: str, detect_latency=None, real=None, margin=N
                 # Результат ПЕРЕВІРЯЄМО: якщо плече не стало (rate-limit біржі),
                 # ордер полетить на дефолті акаунта — а це може бути 10x, де
                 # ліквідація на 10% руху проти нас, тобто ближче за наш стоп-намір.
-                lev_ok = await asyncio.to_thread(exchange.ensure_leverage, venue, symbol,
-                                                 config.LEVERAGE)
+                lev_ok = await _order_thread(exchange.ensure_leverage, venue, symbol,
+                                             config.LEVERAGE)
             t_ord = time.perf_counter()
             try:
-                order = await asyncio.to_thread(exchange.open_short, venue, symbol, contracts)
+                order = await _order_thread(exchange.open_short, venue, symbol, contracts)
             except Exception as e:  # noqa: BLE001
                 # Єдина причина заплатити зайвий раунд: біржа відхилила через маржу,
                 # бо фактичне плече нижче за наше. Виставляємо плече й пробуємо ще раз.
                 if exchange.is_margin_error(e) and not exchange.is_leveraged(venue, symbol):
                     log.event("order_retry_leverage", ticker=ticker, err=str(e)[:120])
                     try:
-                        await asyncio.to_thread(exchange.ensure_leverage, venue, symbol,
-                                                config.LEVERAGE)
-                        order = await asyncio.to_thread(exchange.open_short, venue, symbol,
-                                                        contracts)
+                        await _order_thread(exchange.ensure_leverage, venue, symbol,
+                                            config.LEVERAGE)
+                        order = await _order_thread(exchange.open_short, venue, symbol,
+                                                    contracts)
                     except Exception as e2:  # noqa: BLE001
                         log.exception(f"open_short повторно впав {ticker} {venue}")
                         ambiguous = True
@@ -797,9 +819,10 @@ async def _do_close_inner(pos: dict, price: float, reason: str,
     exit_fee = None
     if pos.get("mode") == "real" and not already_closed:
         try:
-            order = await asyncio.to_thread(
-                exchange.close_short, pos["venue"], pos["symbol"], pos["contracts"]
-            )
+            # Закриття теж у виділеному пулі: стоп за стратегією не має стояти
+            # в черзі за фоновою звіркою — саме тоді, коли ціна йде проти нас.
+            order = await _order_thread(
+                exchange.close_short, pos["venue"], pos["symbol"], pos["contracts"])
         except Exception:  # noqa: BLE001
             log.exception(f"close_short помилка #{pos['id']} {pos['symbol']}")
             # Найчастіша причина відмови — позиції на біржі ВЖЕ НЕМА (спрацював
