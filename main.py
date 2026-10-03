@@ -395,6 +395,7 @@ _HELP = (
     "/health — чи здатен бот відпрацювати делістинг ПРЯМО ЗАРАЗ\n"
     "/preflight — прогнати самоперевірку бойового шляху негайно\n"
     "/wstest — довести, що WS-фід живий (синтетичний анонс)\n"
+    "/dryfire ТИКЕР — прогін усього ланцюга в DRY, без грошей\n"
     "/daily — щоденне зведення зараз (скільки лишилось безкоштовного сервера)\n"
     "/close ID — закрити позицію за id\n"
     "/panic — 🛑 закрити ВСІ позиції\n"
@@ -492,6 +493,33 @@ async def _handle_command(text: str) -> None:
         )
         await executor.open_from_signal(sym, real=True, margin=config.TEST_MARGIN_USDT,
                                        dedup=False, source="test_short")
+
+    elif cmd in ("dryfire", "dry"):
+        # Те саме, що робить справжній сигнал делістингу, але БЕЗ ордера й без
+        # грошей. Навіщо окремо від /preflight: preflight перевіряє КРОКИ
+        # (символ, розмір, ціни стопів), а це проганяє ЖИВИЙ ланцюг у боєвому
+        # процесі — _fire_tickers -> open_from_signal -> облік -> сповіщення —
+        # тобто рівно той код, який між делістингами не виконується тижнями.
+        sym = parts[1].upper() if len(parts) > 1 else "DOGE"
+        t0 = time.perf_counter()
+        await tg.send_message("⏳ Прогін ланцюга в DRY по <b>" + sym + "</b>…")
+        await executor.open_from_signal(sym, real=False,
+                                        margin=config.TEST_MARGIN_USDT,
+                                        dedup=False, source="dryfire")
+        opened = [p for p in storage.get_open_positions()
+                  if p["ticker"] == sym and p.get("mode") == "dry"]
+        ms = round((time.perf_counter() - t0) * 1000, 1)
+        if opened:
+            pid = opened[-1]["id"]
+            closed = await executor.force_close(pid, reason="MANUAL")
+            await tg.send_message(
+                "✅ Ланцюг ПРАЦЮЄ: позицію #" + str(pid) + " відкрито (dry) і "
+                + ("закрито" if closed else "НЕ закрито — перевір") + chr(10)
+                + "Весь прохід: " + str(ms) + "мс")
+        else:
+            await tg.send_message(
+                "❌ Ланцюг НЕ дійшов до обліку по <b>" + sym + "</b>." + chr(10)
+                + "Причину шукай у свіжих подіях skip/entry_failed.")
 
     elif cmd == "close":
         if len(parts) < 2 or not parts[1].isdigit():
