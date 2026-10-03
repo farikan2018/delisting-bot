@@ -45,9 +45,17 @@ def check(name, cond, extra=""):
 
 
 def tradeable(msg):
-    """Точна копія умови з tgfeed._on_message: чи піде це в реальну угоду."""
+    """Точна копія умови з tgfeed._on_message: чи піде це в реальну угоду.
+
+    Категорійні ворота додані 2026-10-03: без них цей шлях торгував би БУДЬ-ЯКИЙ
+    «BINANCE Delisting Announcement», тоді як поллінг і WS свідомо торгують лише
+    повний спот-делістинг.
+    """
+    import binance_watcher as bw
     p = tgfeed.parse(msg)
-    return (p["exchange"] == "BINANCE" and p["is_delist"] and bool(p["tickers"])), p
+    ok = (p["exchange"] == "BINANCE" and p["is_delist"] and bool(p["tickers"])
+          and (not p["category"] or p["category"] == bw.SPOT_DELIST))
+    return ok, p
 
 
 print("=== 1) BINANCE-делістинг: єдине, що торгуємо ===")
@@ -100,6 +108,42 @@ check("оцінка віку в межах воріт застарілості",
 print("\n=== 6) ТИКЕРИ беруться лише з $-префіксом ===")
 p = tgfeed.parse("BINANCE Delisting Announcement – $ICX and USDT pairs on BINANCE")
 check("службові слова не потрапили", p["tickers"] == ["ICX"], str(p["tickers"]))
+
+print("\n=== 7) КАТЕГОРІЯ: з трьох видів «BINANCE Delisting» торгуємо рівно один ===")
+# Форма цих повідомлень відтворює реальну: канал цитує оригінальний заголовок
+# Binance окремим рядком. Саме з нього береться категорія.
+_D = "  Detected (UTC): 2026-08-20T06:00:08.885836Z (µs precision)"
+CAT_CASES = [
+    ("повний спот-делістинг", True, "SPOT_DELIST",
+     "BINANCE Delisting Announcement – $ICX, $SCRT, $STORJ  "
+     "Binance Will Delist ICX, SCRT, STORJ on 2026-09-03" + _D),
+    ("margin/loan — заміряно НУЛЬ обвалів ≥10% із 48 пар", False, "MARGIN_DELIST",
+     "BINANCE Delisting Announcement – $TST, $IOTX  "
+     "Binance Margin And Loan Will Delist TST & IOTX on 2026-07-10" + _D),
+    ("ф'ючерсний контракт — спот лишається", False, "FUTURES_DELIST",
+     "BINANCE Delisting Announcement – $AERGO  "
+     "Binance Futures Will Delist USD-M AERGOUSDT Perpetual Contract (2026-07-24)" + _D),
+    ("прибирання торгових пар", False, "PAIR_REMOVAL",
+     "BINANCE Delisting Announcement – $ABC  "
+     "Notice of Removal of Spot Trading Pairs - 2026-10-02" + _D),
+]
+for name, want_trade, want_cat, msg in CAT_CASES:
+    ok, p = tradeable(msg)
+    check(name + ": категорія " + want_cat, p["category"] == want_cat, p["category"])
+    check(name + (": торгується" if want_trade else ": НЕ торгується"), ok == want_trade)
+
+# Заголовка нема — категорію визначити ні з чого. Свідомо торгуємо (пропустити
+# делістинг дорожче за зайву угоду на $12), але це має бути видно в логу.
+ok, p = tradeable("BINANCE Delisting Announcement – $ICX" + _D)
+check("без заголовка: категорії нема", p["category"] == "", p["category"])
+check("без заголовка: все одно торгуємо (fail-open)", ok)
+
+print("\n=== 8) ОДНОЛІТЕРНІ ТИКЕРИ — реальний випадок «COS, D, HIGH, MBOX» ===")
+ok, p = tradeable("BINANCE Delisting Announcement – $COS, $D, $HIGH, $MBOX  "
+                  "Binance Will Delist COS, D, HIGH, MBOX on 2026-06-19" + _D)
+check("тикер D не загублено", p["tickers"] == ["COS", "D", "HIGH", "MBOX"],
+      str(p["tickers"]))
+check("торгується", ok)
 
 print("\n" + ("ТЕСТ ПАРСЕРА OK" if not FAILS else f"ПРОВАЛЕНО: {FAILS}"))
 sys.exit(1 if FAILS else 0)

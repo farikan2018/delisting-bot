@@ -30,7 +30,7 @@ _claimed: dict = {}         # тикер -> час заявки (TTL, див. _r
 _open_symbols: set = set()  # символи з відкритою позицією (люстро БД у памʼяті)
 _reserved: int = 0          # відкриттів «у дорозі» — щоб не пробити MAX_CONCURRENT
 _reserved_margin: float = 0.0  # маржа відкриттів «у дорозі» (баланс-гард)
-_closing: set = set()       # pos_id, які вже закриваються (monitor vs reconcile)
+_closing: dict = {}         # pos_id -> задача, що закриває (реентрантно, див. _do_close)
 _flat_seen: dict = {}       # pos_id -> скільки разів поспіль біржа показала «нема позиції»
 _close_alerted: set = set()  # pos_id, по яких уже кричали про невдале закриття
 
@@ -67,10 +67,32 @@ def daily_pnl() -> float:
     return _daily_pnl
 
 
+def _risk_in_flight() -> float:
+    """Найгірший ще НЕ реалізований збиток по позиціях, що відкриті або в дорозі.
+
+    Кожна позиція обмежена стопом у STOP_LOSS_MARGIN_PCT% маржі, тож верхня межа
+    рахується точно, без звернень до біржі.
+    """
+    n = len(_open_symbols) + _reserved
+    return n * config.POSITION_MARGIN_USDT * config.STOP_LOSS_MARGIN_PCT / 100.0
+
+
 def _kill_switch_hit() -> bool:
-    """True = денний ліміт збитку вичерпано, нових позицій не відкриваємо."""
+    """True = денний ліміт збитку вичерпано, нових позицій не відкриваємо.
+
+    РАХУЄМО Й ЗБИТОК У ДОРОЗІ (2026-10-03). Раніше тут був лише реалізований PnL,
+    тобто лічильник, який оновлюється ТІЛЬКИ при закритті позиції. Наслідок: один
+    анонс відкриває три позиції паралельно, усі три проходять перевірку, бо жодна
+    ще не закрилась, і ліміт фізично не може спрацювати всередині події. На живих
+    числах (.env: маржа $3, стоп -30% маржі, ліміт $4) це давало перевищення в
+    1.7-2 рази: лічильник на -$3.0 ліміт не пробив, а три нові позиції додали ще
+    до -$2.7 зверху.
+
+    Верхня межа збитку позиції відома точно — це її стоп, — тому резерв не
+    здогадка, а арифметика.
+    """
     lim = config.MAX_DAILY_LOSS_USDT
-    return lim > 0 and daily_pnl() <= -lim
+    return lim > 0 and (daily_pnl() - _risk_in_flight()) <= -lim
 
 
 def resync_open() -> None:
@@ -102,13 +124,30 @@ def _reserve(ticker: str, symbol: str, margin: float = 0.0) -> str:
     return ""
 
 
-def _release(ticker: str, symbol: str, opened: bool, margin: float = 0.0) -> None:
+def _release(ticker: str, symbol: str, opened: bool, margin: float = 0.0,
+             drop_claim: bool = False) -> None:
+    """drop_claim=True — знімаємо заявку, бо ТОЧНО відомо, що позиції не виникло.
+
+    Навіщо (2026-10-03). Заявка живе CLAIM_TTL_SEC=900с. Це правильно, поки
+    позиція жива. Але якщо вхід ЗІРВАВСЯ — наприклад, Bybit відповів 503 на
+    найшвидшому джерелі, — заявка все одно блокувала тикер на 15 хвилин. Той
+    самий анонс від повільнішого джерела приходить через 10-40с і отримував
+    `duplicate_source`. Тобто одна транзієнтна помилка вбивала угоду, заради
+    якої чекали місяць, і робила це мовчки.
+
+    Знімаємо заявку ЛИШЕ коли невизначеності нема. Якщо ордер відповів помилкою,
+    але позиція могла відкритись (загублена відповідь), заявку тримаємо — інакше
+    повторний сигнал відкрив би ДРУГУ позицію поверх першої. Для цього випадку є
+    _adopt_orphan: він питає біржу і сам знімає заявку, коли доведено, що чисто.
+    """
     global _reserved, _reserved_margin
     _reserved = max(0, _reserved - 1)
     _reserved_margin = max(0.0, _reserved_margin - margin)
     if opened:
         _open_symbols.add(symbol)
         _claimed[ticker] = time.time()  # поки позиція жива, дублі не потрібні
+    elif drop_claim:
+        _claimed.pop(ticker, None)
 
 
 def busy() -> bool:
@@ -218,6 +257,10 @@ async def open_from_signal(ticker: str, detect_latency=None, real=None, margin=N
             return
 
     opened = False
+    # True, щойно ми відправили ордер і НЕ знаємо напевно його долю. Поки це так,
+    # заявку на тикер знімати НЕ можна: повторний сигнал відкрив би другу позицію
+    # поверх можливо вже відкритої. Долю з'ясовує _adopt_orphan.
+    ambiguous = False
     try:
         # 3) СИНХРОННО: ціна + ref із price-cache (в памʼяті). REST — лише як фолбек.
         entry_price = ref_price = None
@@ -275,11 +318,13 @@ async def open_from_signal(ticker: str, detect_latency=None, real=None, margin=N
                                                         contracts)
                     except Exception as e2:  # noqa: BLE001
                         log.exception(f"open_short повторно впав {ticker} {venue}")
+                        ambiguous = True
                         fire(_adopt_orphan(ticker, venue, symbol, entry_price, margin,
                                            contract_size, decision, str(e2)))
                         return
                 else:
                     log.exception(f"open_short помилка {ticker} {venue}")
+                    ambiguous = True
                     fire(_adopt_orphan(ticker, venue, symbol, entry_price, margin,
                                        contract_size, decision, str(e)))
                     return
@@ -300,6 +345,7 @@ async def open_from_signal(ticker: str, detect_latency=None, real=None, margin=N
             # Мовчки вийти не можна: на біржі висітиме позиція, якої нема в обліку.
             log.exception(f"insert_position впав {ticker}")
             if real:
+                ambiguous = True
                 fire(_adopt_orphan(ticker, venue, symbol, entry_price, margin,
                                    contract_size, decision, f"insert_position: {e}"))
             return
@@ -326,7 +372,12 @@ async def open_from_signal(ticker: str, detect_latency=None, real=None, margin=N
             fire(_settle_and_arm(pos_id, pos, order))
     finally:
         if dedup:
-            _release(ticker, symbol, opened, margin if real else 0.0)
+            # Вхід не відбувся і невизначеності нема (виняток ДО ордера, відмова
+            # стратегії, промах ціни) — знімаємо заявку, щоб повільніше джерело
+            # мало право на другу спробу по цій самій події. Раніше тикер лишався
+            # заблокованим 15 хвилин, тобто на весь дамп.
+            _release(ticker, symbol, opened, margin if real else 0.0,
+                     drop_claim=not opened and not ambiguous)
 
 
 async def _adopt_orphan(ticker: str, venue: str, symbol: str, entry_price: float,
@@ -359,9 +410,16 @@ async def _adopt_orphan(ticker: str, venue: str, symbol: str, entry_price: float
         return
 
     if size <= 0:  # ордер справді не пройшов — усе чисто
-        log.event("orphan_none", ticker=ticker, symbol=symbol, err=err[:200])
+        # Доведено, що позиції нема → знімаємо заявку. Без цього тикер лишався б
+        # заблокованим CLAIM_TTL_SEC=900с, і повторний сигнал від повільнішого
+        # джерела (поллінг на +33с) відсікався б як duplicate_source. Тобто одна
+        # транзієнтна відмова біржі коштувала б усієї події.
+        _claimed.pop(ticker.upper(), None)
+        log.event("orphan_none", ticker=ticker, symbol=symbol, err=err[:200],
+                  claim_released=True)
         await tg.send_message(f"❌ <b>{ticker}</b>: помилка ордера ({venue}), "
-                              f"позиції на біржі нема — чисто.")
+                              f"позиції на біржі нема — чисто. "
+                              f"Заявку знято: повторний сигнал матиме другий шанс.")
         return
 
     pos = {"ticker": ticker, "symbol": symbol, "venue": venue, "mode": "real",
@@ -701,16 +759,35 @@ async def _do_close(pos: dict, price: float, reason: str,
 
     Закриття НЕ ідемпотентне саме по собі: monitor_once і reconcile_real — два
     незалежні цикли, і між читанням позиції та її закриттям є await. Без замка
-    обидва встигли б послати ордер на закриття однієї позиції."""
+    обидва встигли б послати ордер на закриття однієї позиції.
+
+    ЗАМОК РЕЕНТРАНТНИЙ ДЛЯ СВОЄЇ Ж ЗАДАЧІ (2026-10-03). Раніше це був простий
+    set, і він блокував сам себе на ШТАТНОМУ шляху: біржовий стоп спрацював →
+    monitor кличе _do_close → _closing.add(pid) → close_short відхилено, бо
+    позиції вже нема → гілка size==0 кличе _reconcile_one → той кличе _do_close
+    із already_closed=True → pid уже в _closing → `close_skipped_inflight` і
+    вихід. Запис у БД лишався ВІДКРИТИМ, монітор довбив close_short раз на дві
+    секунди, а слот із трьох зайнятий, поки окремий цикл звірки не добереться.
+    У логах це рівно 7 подій close_already_flat і рівно 7 close_skipped_inflight.
+
+    Справжня мета замка — не пустити ДРУГУ задачу (monitor проти reconcile), а не
+    заборонити тій самій задачі довести своє ж закриття до кінця. Тому ключем
+    тепер є задача-власник. Зовнішній виклик після вкладеного одразу робить
+    return, тож подвійного закриття запису не виникає."""
     pid = pos["id"]
-    if pid in _closing:
+    cur = asyncio.current_task()
+    owner = _closing.get(pid)
+    if owner is not None and owner is not cur:
         log.event("close_skipped_inflight", pos_id=pid, reason=reason)
         return
-    _closing.add(pid)
+    reentrant = owner is cur
+    if not reentrant:
+        _closing[pid] = cur
     try:
         await _do_close_inner(pos, price, reason, already_closed, exact_exit)
     finally:
-        _closing.discard(pid)
+        if not reentrant:
+            _closing.pop(pid, None)
 
 
 async def _do_close_inner(pos: dict, price: float, reason: str,

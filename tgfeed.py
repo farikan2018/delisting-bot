@@ -38,17 +38,40 @@ import datetime as dt
 import re
 import time
 
+import alerts
+import binance_watcher as bw
 import config
 import logbook as log
 
 _handler = None
 _stats = {"msgs": 0, "binance_delist": 0, "signals": 0, "skipped_stale": 0,
-          "connects": 0, "last_msg_ms": 0}
+          "connects": 0, "last_msg_ms": 0, "errors": 0, "fatal": None}
+
+# Винятки Telethon, яких ретрай НЕ ЛІКУЄ: ключ авторизації відкликано назавжди,
+# новий можна отримати лише повторним входом із телефону (tg_login.py).
+# Чому це окремий список. 2026-08-30 о 14:21 сесія померла з AuthKeyDuplicatedError
+# (її використали з двох IP одночасно), і цикл нижче 34 доби поспіль перепідключався
+# кожні 120с: 24411 однакових подій у events.jsonl, нуль сповіщень, швидкий тригер
+# де-факто мертвий. Ретрай на такій помилці — не стійкість, а шум, який ХОВАЄ аварію.
+_FATAL_ERRORS = (
+    "AuthKeyDuplicatedError", "AuthKeyUnregisteredError", "AuthKeyInvalidError",
+    "SessionRevokedError", "SessionExpiredError", "UserDeactivatedError",
+    "UserDeactivatedBanError", "PhoneNumberBannedError",
+)
 
 # «$ICX, $SCRT» -> ICX, SCRT. Канал завжди префіксує тикери доларом, тож це
 # надійніше за витягування великих слів із довільного тексту.
-_TICKER_RE = re.compile(r"\$([A-Z][A-Z0-9]{1,9})\b")
+# Одна літера дозволена свідомо: реальний анонс «Binance Will Delist COS, D, HIGH,
+# MBOX» містить тикер D, і старий мінімум у два символи його губив. binance_watcher
+# однолітерні тикери приймає, і розбіжність між двома шляхами означала б, що та сама
+# подія торгується або ні залежно від того, яке джерело спрацювало першим.
+_TICKER_RE = re.compile(r"\$([A-Z][A-Z0-9]{0,9})\b")
 _DETECTED_RE = re.compile(r"Detected \(UTC\):\s*([0-9T:.\-]+)Z")
+# Канал цитує ОРИГІНАЛЬНИЙ заголовок Binance окремим рядком між переліком тикерів
+# і міткою Detected. Він потрібен, щоб прогнати повідомлення через ту саму
+# класифікацію, що й головний шлях (binance_watcher.classify).
+_TITLE_RE = re.compile(r"\$[A-Z][A-Z0-9]{0,9}(?:\s*,\s*\$[A-Z][A-Z0-9]{0,9})*\s+"
+                       r"(.+?)\s+Detected \(UTC\):")
 
 
 def set_handler(fn) -> None:
@@ -64,6 +87,17 @@ def stats() -> dict:
     return d
 
 
+def healthy() -> bool:
+    """Чи є ДОКАЗ, що канал живий саме як джерело даних.
+
+    Доказ — отримане повідомлення, а не наявність кредів і не вдале підключення.
+    Саме ця різниця коштувала 34 діб: креди були на місці, `cap_tg_feed` світився
+    зеленим, одне `tg_feed_connected` у логу було — а повідомлень нуль.
+    """
+    return (bool(config.TG_API_ID and config.TG_API_HASH and config.TG_SESSION)
+            and _stats["fatal"] is None and _stats["msgs"] > 0)
+
+
 def parse(text: str) -> dict:
     """Розбирає пост каналу. Повертає що зміг; рішення ухвалює викликач."""
     flat = " ".join((text or "").split())
@@ -77,6 +111,8 @@ def parse(text: str) -> dict:
         except Exception:  # noqa: BLE001
             detected_ms = None
     first = flat.split(" ", 1)[0].upper() if flat else ""
+    tm = _TITLE_RE.search(flat)
+    title = tm.group(1).strip() if tm else ""
     return {
         "text": flat,
         "exchange": first if first.isalpha() else "",
@@ -84,6 +120,13 @@ def parse(text: str) -> dict:
         "is_listing": "listing" in low,
         "tickers": _TICKER_RE.findall(flat),
         "feed_detected_ms": detected_ms,
+        "binance_title": title,
+        # Та сама класифікація, що й у поллінг-шляху. Без неї цей шлях торгував би
+        # БУДЬ-ЯКИЙ «BINANCE Delisting Announcement» — включно з margin-делістингом
+        # (заміряно: -0.24% за хвилину, обвал >=10% у НУЛЯ з 48 пар) і з
+        # ф'ючерсним. Тобто дві з трьох категорій, які головний шлях свідомо не
+        # торгує, тут відкривали б реальну позицію на $12 номіналу.
+        "category": bw.classify(title) if title else "",
     }
 
 
@@ -100,11 +143,24 @@ async def _on_message(text: str) -> None:
 
     log.event("tg_feed_msg", exchange=p["exchange"], is_delist=p["is_delist"],
               tickers=p["tickers"], transport_sec=transport, est_age_sec=age,
-              title=p["text"][:160])
+              category=p["category"], title=p["text"][:160])
 
     if p["exchange"] != "BINANCE" or not p["is_delist"] or not p["tickers"]:
         return
     _stats["binance_delist"] += 1
+
+    # Категорія з ОРИГІНАЛЬНОГО заголовка Binance. Торгуємо лише повний спот-
+    # делістинг — рівно як поллінг і WS. Якщо заголовка в пості нема, категорію
+    # визначити ні з чого: тоді торгуємо (пропустити делістинг дорожче за зайву
+    # угоду на $12), але лишаємо гучний слід, щоб побачити реальні формати каналу
+    # і уточнити правило на даних, а не на здогадці.
+    if p["category"] and p["category"] != bw.SPOT_DELIST:
+        _stats["skipped_category"] = _stats.get("skipped_category", 0) + 1
+        log.event("tg_feed_category_no_trade", tickers=p["tickers"],
+                  category=p["category"], title=p["binance_title"][:160])
+        return
+    if not p["category"]:
+        log.event("tg_feed_no_title", tickers=p["tickers"], text=p["text"][:200])
 
     if not config.TG_FEED_TRADE:
         log.event("tg_feed_no_trade", tickers=p["tickers"],
@@ -170,7 +226,35 @@ async def run() -> None:
             await client.run_until_disconnected()
             log.event("tg_feed_disconnected", **stats())
         except Exception as e:  # noqa: BLE001
-            log.event("tg_feed_error", err=f"{type(e).__name__}: {str(e)[:150]}",
-                      retry_sec=round(backoff, 1))
+            name = type(e).__name__
+            _stats["errors"] += 1
+            if name in _FATAL_ERRORS:
+                # Ретрай тут безсенсу: сесію відкликано, лікує лише новий вхід.
+                # Виходимо з циклу — краще ОДНА гучна аварія, ніж вічний шум.
+                _stats["fatal"] = name
+                log.event("tg_feed_fatal", err=name, detail=str(e)[:200],
+                          errors=_stats["errors"])
+                log.error("tg_feed: сесію Telegram відкликано (" + name
+                          + ") — читач ЗУПИНЕНО, потрібен новий TG_SESSION")
+                await alerts.raise_alert(
+                    "Телеграм-фід мертвий: " + name,
+                    "Сесію Telegram відкликано — ретрай це не лікує, читач зупинено."
+                    + chr(10) + "Швидкий тригер №2 недоступний." + chr(10)
+                    + "Лікується лише новою сесією на сервері:" + chr(10)
+                    + "<code>cd ~/delisting-bot &amp;&amp; .venv/bin/python tg_login.py</code>"
+                    + chr(10) + "далі покласти новий TG_SESSION у .env і "
+                    + "<code>sudo systemctl restart delisting-bot</code>",
+                    cooldown_sec=24 * 3600)
+                return
+            # Не-фатальні: мережа, флуд-вейт, тимчасовий збій ДЦ. Ретраїмо, але
+            # НЕ пишемо 24 тисячі однакових рядків — лише перші кілька й далі рідко.
+            if _stats["errors"] <= 3 or _stats["errors"] % 100 == 0:
+                log.event("tg_feed_error", err=name + ": " + str(e)[:150],
+                          errors=_stats["errors"], retry_sec=round(backoff, 1))
+            if _stats["errors"] in (20, 500):
+                await alerts.raise_alert(
+                    "Телеграм-фід не підключається",
+                    "Спроб поспіль: " + str(_stats["errors"]) + chr(10)
+                    + name + ": " + str(e)[:150])
         await asyncio.sleep(backoff)
         backoff = min(120.0, backoff * 2)

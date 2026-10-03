@@ -310,9 +310,18 @@ def ticker_by_raw(raw: str) -> str | None:
 def prearm_symbols() -> dict:
     """Будує HOT по всіх активних USDT-перпах у порядку VENUE_PRIORITY.
     Перша біржа, де токен є, і виграє — та сама логіка, що в resolve(), але
-    порахована заздалегідь."""
-    HOT.clear()
-    BY_RAW.clear()
+    порахована заздалегідь.
+
+    ЗБИРАЄМО В НОВІ ДИКТИ І ПІДМІНЯЄМО ОДНИМ ПРИСВОЄННЯМ (2026-10-03). Раніше тут
+    стояло HOT.clear() із подальшим заповненням. Поки карта будується (а це тисячі
+    ринків), hot_meta() повертав би None — тобто сигнал, що влучив у це вікно, дав
+    би «нема перпа» і тихий пропуск делістингу. На старті вікно нікого не чіпало,
+    але відколи карта перебудовується ще й періодично (див. reload_markets),
+    вікно стало реальним ризиком. Присвоєння імені атомарне, вікна нема зовсім.
+    """
+    global HOT, BY_RAW
+    hot: dict[str, dict] = {}
+    by_raw: dict[str, str] = {}
     per_venue = {}
     for v in config.VENUE_PRIORITY:
         try:
@@ -326,15 +335,43 @@ def prearm_symbols() -> dict:
             if m.get("quote") != "USDT" or m.get("settle") != "USDT":
                 continue
             base = (m.get("base") or "").upper()
-            if not base or base in HOT:  # пріоритет біржі — перша перемагає
+            if not base or base in hot:  # пріоритет біржі — перша перемагає
                 continue
-            HOT[base] = {"venue": v, "symbol": sym, "raw_id": m.get("id"),
+            hot[base] = {"venue": v, "symbol": sym, "raw_id": m.get("id"),
                          "contract_size": m.get("contractSize") or 1}
             if v == "bybit" and m.get("id"):  # детектор обвалу знає лише сирий bybit-ID
-                BY_RAW[m["id"]] = base
+                by_raw[m["id"]] = base
             n += 1
         per_venue[v] = n
+    if not hot:
+        # Жоден ринок не зібрався (усі біржі лежать / ключі відвалились). Підмінити
+        # робочу карту порожньою означало б осліпнути: кожен тикер дав би «нема
+        # перпа». Краще лишити стару карту — вона застаріла, але робоча.
+        return {"total": len(HOT), "kept_old": True, **per_venue}
+    HOT, BY_RAW = hot, by_raw
     return {"total": len(HOT), **per_venue}
+
+
+def reload_markets() -> dict:
+    """Перетягує список ринків з бірж і перебудовує HOT.
+
+    НАВІЩО. HOT будується один раз на старті, а процес живе місяцями (на момент
+    написання — 49 діб без рестарту). Перп, доданий на Bybit після старту, для
+    бота не існує: `hot_meta` поверне None і делістинг цього токена дасть подію
+    `skip no_perp` — тобто тиху втрату саме тієї рідкісної події, заради якої все
+    це працює. Блокуючі виклики ccxt, тому викликати лише через to_thread і НЕ на
+    гарячому шляху.
+    """
+    reloaded = {}
+    for v in config.VENUE_PRIORITY:
+        try:
+            client(v).load_markets(True)
+            reloaded[v] = "ok"
+        except Exception as e:  # noqa: BLE001
+            reloaded[v] = type(e).__name__
+    before = len(HOT)
+    st = prearm_symbols()
+    return {**st, "before": before, "added": len(HOT) - before, "reload": reloaded}
 
 
 def hot_meta(ticker: str) -> dict | None:

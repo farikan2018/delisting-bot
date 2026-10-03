@@ -26,7 +26,11 @@ except ImportError:
 TARGETS = ["main.py", "executor.py", "exchange.py", "strategy.py", "storage.py",
            "config.py", "fastcms.py", "binance_watcher.py", "pricecache.py",
            "dumpwatch.py", "runtime.py", "logbook.py", "telegram_client.py",
-           "admin.py", "probe.py"]
+           "admin.py", "probe.py",
+           # Додано 2026-10-03. tgfeed.py не був у списку — а це рівно той модуль,
+           # який мовчки лежав 34 доби. Модуль поза лінтом ризикує повторити
+           # історію з NameError заради якої цей тест і писався.
+           "tgfeed.py", "wsfeed.py", "watchdog.py", "alerts.py", "preflight.py"]
 
 # Що вважаємо фатальним. Невживані імпорти й змінні — шум, не помилка.
 FATAL = ("undefined name", "undefined local", "syntax error",

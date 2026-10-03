@@ -287,13 +287,30 @@ exchange.set_position_stop = _fake_set_stop
 # ---------- 9) подвійне закриття ----------
 print("\n9) Монітор і звірка не можуть закрити одну позицію двічі")
 orp = next(p for p in storage.get_open_positions() if p["ticker"] == "ORP")
-executor._closing.add(orp["id"])
+# Замок тримає ІНША задача — саме від цього він і захищає.
+executor._closing[orp["id"]] = "інша-задача"
 n_before = storage.open_positions_count()
 asyncio.run(executor._do_close(orp, 1.0, "MANUAL"))
 check("закриття «в дорозі» ігнорується", storage.open_positions_count() == n_before)
-executor._closing.discard(orp["id"])
-asyncio.run(executor._do_close(orp, 1.0, "MANUAL", already_closed=True))
-check("після зняття замка закривається", storage.open_positions_count() == n_before - 1)
+executor._closing.pop(orp["id"], None)
+
+# Реентрантність: той самий шлях, яким ходить штатне закриття по біржовому стопу.
+# Раніше тут був простий set, і вкладений виклик (_do_close -> close_short відхилено
+# -> _reconcile_one -> _do_close) блокував сам себе: запис лишався ВІДКРИТИМ, монітор
+# довбив біржу раз на дві секунди, а слот із трьох був зайнятий. У бойовому лозі це
+# рівно 7 подій close_already_flat і рівно 7 close_skipped_inflight.
+async def _nested():
+    async def outer():
+        executor._closing[orp["id"]] = asyncio.current_task()
+        try:
+            await executor._do_close(orp, 1.0, "MANUAL", already_closed=True)
+        finally:
+            executor._closing.pop(orp["id"], None)
+    await outer()
+
+asyncio.run(_nested())
+check("вкладене закриття ТІЄЇ Ж задачі проходить",
+      storage.open_positions_count() == n_before - 1)
 check("замок звільнено", orp["id"] not in executor._closing)
 
 # ---------- 10) заявка на тикер має TTL ----------

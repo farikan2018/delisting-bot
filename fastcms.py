@@ -64,7 +64,8 @@ _seen: set[str] = set()          # заявлені article_id (синхронн
 # з різними RTT. Подій 8-9 на рік, тому кожна має дати однозначні дані.
 _sighted: set[tuple[str, str]] = set()
 _on_event = None
-_stats = {"polls": 0, "errors": 0, "new": 0, "by_host": {}, "polls_by_host": {}}
+_stats = {"polls": 0, "errors": 0, "new": 0, "by_host": {}, "polls_by_host": {},
+          "last_poll_ms": 0, "last_new_ms": 0, "last_article_ms": 0}
 
 
 def set_handler(cb) -> None:
@@ -87,7 +88,19 @@ def seen_count() -> int:
 
 
 def stats() -> dict:
-    return dict(_stats, seen=len(_seen), hosts=len(HOSTS))
+    """Знімок для /status, добового зведення і сторожа.
+
+    Поля `*_age_sec` існують саме для сторожа: він має відрізняти «опитуємо, просто
+    анонсів нема» від «цикл стоїть». Лічильника polls для цього не досить — він
+    монотонний, і 2.2 млн опитів виглядають однаково і коли темп 8/с, і коли нуль.
+    """
+    now = time.time()
+    d = dict(_stats, seen=len(_seen), hosts=len(HOSTS))
+    for src, dst in (("last_poll_ms", "last_poll_age_sec"),
+                     ("last_new_ms", "last_new_age_sec"),
+                     ("last_article_ms", "last_article_age_sec")):
+        d[dst] = round(now - _stats[src] / 1000, 1) if _stats[src] else None
+    return d
 
 
 def prime() -> int:
@@ -110,6 +123,11 @@ def _articles(data: dict):
 
 async def _handle(art: dict, host: str) -> None:
     title = art.get("title", "")
+    # Відмітка «ендпоінт справді віддає статті» — ДО будь-яких фільтрів. Саме вона
+    # відрізняє «анонсів нема» від «Binance змінив формат і ми розбираємо порожнечу»:
+    # polls при зміні формату так само росли б, бо HTTP 200 нікуди не дівається.
+    if title:
+        _stats["last_article_ms"] = int(time.time() * 1000)
     if not bw._DELIST_HINT.search(title):
         return
     aid = str(art.get("id") or art.get("code") or title)
@@ -134,6 +152,7 @@ async def _handle(art: dict, host: str) -> None:
         category=bw.classify(title), release_ms=release_ms,
     )
     _stats["new"] += 1
+    _stats["last_new_ms"] = now_ms
     _stats["by_host"][host] = _stats["by_host"].get(host, 0) + 1
     log.event("fastcms_new", article_id=aid, host=host, category=ev.category,
               tickers=ev.tickers, title=title, release_ms=release_ms,
@@ -164,6 +183,7 @@ async def _poll_host(host: str, phase: float) -> None:
                         raise RuntimeError(f"HTTP {r.status}")
                 data = fastjson.loads(body)
                 _stats["polls"] += 1
+                _stats["last_poll_ms"] = int(time.time() * 1000)
                 _stats["polls_by_host"][host] = _stats["polls_by_host"].get(host, 0) + 1
                 backoff = 0.0
                 for art in _articles(data):

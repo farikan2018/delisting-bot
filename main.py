@@ -18,6 +18,7 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:  # noqa: BLE001
         pass
 
+import alerts
 import binance_watcher as bw
 import config
 import dumpwatch
@@ -26,11 +27,14 @@ import executor
 import fastcms
 import fastjson
 import logbook as log
+import preflight
 import pricecache
 import runtime
 import storage
 import telegram_client as tg
 import tgfeed
+import watchdog
+import wsfeed
 
 
 _LOOP = "asyncio"  # перезаписується в __main__ на "uvloop", якщо він доступний
@@ -65,8 +69,20 @@ async def _fire_tickers(tickers: list[str], latency, source: str) -> None:
     async def one(tk: str) -> None:
         try:
             await executor.open_from_signal(tk, detect_latency=latency, source=source)
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            # Тихо втратити сигнал тут не можна. Весь шлях від ціни до ордера не
+            # захищений власним except, тож будь-який мережевий збій (fetch_ticker
+            # без try/except, таймаут, 429) прилітає саме сюди — і раніше йшов
+            # ЛИШЕ в лог-файл. Користувач при цьому бачив сповіщення «детектор
+            # зловив делістинг» і робив висновок, що угода відкрита. Делістинг
+            # буває раз на 3-6 тижнів: мовчазна втрата = втрачений місяць.
             log.exception(f"executor помилка по {tk}")
+            log.event("entry_failed", ticker=tk, source=source,
+                      err=f"{type(e).__name__}: {e}"[:200], detect_latency_sec=latency)
+            executor.fire(tg.send_message(
+                "🚨 <b>" + tk + "</b>: вхід ЗІРВАВСЯ — угоди НЕМА." + chr(10)
+                + "<code>" + f"{type(e).__name__}: {e}"[:160] + "</code>" + chr(10)
+                + "Джерело: " + source))
     await asyncio.gather(*(one(tk) for tk in tickers))
 
 
@@ -82,7 +98,21 @@ async def _on_fastcms(ev: bw.DelistingEvent, latency, host: str) -> None:
     if not config.FASTCMS_TRADE:
         log.event("fastcms_no_trade", tickers=ev.tickers, reason="FASTCMS_TRADE=0")
         return
-    if latency is not None and latency > config.MAX_SIGNAL_AGE_SEC:
+    # Вік сигналу НЕВІДОМИЙ (у статті нема releaseDate) — на шляху ПОЛЛІНГА це
+    # привід не торгувати, а не привід торгувати. Заміряна медіана детекту
+    # поллінгом 46с при порозі 60с: сигнал невідомого віку з цього джерела майже
+    # напевно вже мертвий. Раніше latency=None повністю обходив ворота — тобто
+    # найменш надійний випадок проходив найлегше.
+    # Для пуш-джерел (WS, телеграм-фід) логіка протилежна і свідомо інша: там
+    # відсутність мітки означає лише зміну схеми, а сам пуш за побудовою свіжий.
+    if latency is None:
+        log.event("fastcms_no_release_no_trade", tickers=ev.tickers,
+                  article_id=ev.article_id, title=ev.title[:120])
+        executor.fire(tg.send_message(
+            "⏱️ <b>" + ", ".join(ev.tickers) + "</b>: у статті нема дати публікації, "
+            "вік сигналу невідомий — поллінгом НЕ торгую."))
+        return
+    if latency > config.MAX_SIGNAL_AGE_SEC:
         log.event("fastcms_stale_no_trade", tickers=ev.tickers, latency_sec=latency)
         return
     await _fire_tickers(ev.tickers, latency, f"fastcms:{host.split('.')[0]}")
@@ -125,7 +155,12 @@ async def _watch_loop() -> None:
                               category=ev.category, tickers=ev.tickers, title=ev.title,
                               release_ms=ev.release_ms, detected_ms=now_ms,
                               detect_latency_sec=latency, actionable=ev.actionable)
-                    await tg.send_message(_fmt_event(ev))
+                    # Сповіщення — у ФОН. Раніше тут стояв await: ордер чекав на
+                    # відповідь api.telegram.org (сотні мс, інколи секунди) ПЕРЕД
+                    # власним відкриттям. На кривій входу це чистий збиток, і саме
+                    # цей шлях працює тоді, коли швидкий тригер мертвий — тобто
+                    # зараз. Швидкий шлях (_on_fastcms) так робив уже давно.
+                    executor.fire(tg.send_message(_fmt_event(ev)))
 
                     # Поллінг — лише СТОРОЖ. Торгуємо тільки якщо сигнал свіжий
                     # (зазвичай це WS; поллінг ~126с → лише попередження).
@@ -150,64 +185,17 @@ async def _watch_loop() -> None:
             await asyncio.sleep(config.POLL_INTERVAL)
 
 
-async def _handle_ws_delisting(d: dict) -> None:
-    """Обробка делістинг-події з WebSocket-фіда (основний, швидкий тригер)."""
-    now_ms = int(time.time() * 1000)
-    disp = d.get("dispatchTimestampUs")
-    age = round((now_ms - disp / 1000) / 1000, 2) if disp else None  # транспортна затримка від фіда
-    listing_type = d.get("listingType")
-    tickers = [t.strip().upper() for t in (d.get("ticker") or "").split(",") if t.strip()]
-    log.event("ws_delisting", listing_type=listing_type, ticker=d.get("ticker"),
-              title=d.get("title"), tickers=tickers, transport_age_sec=age)
-    # Сповіщення про сигнал — у фоні, щоб НЕ затримувати відкриття угоди.
-    executor.fire(tg.send_message(
-        f"⚡ <b>WS-сигнал: {listing_type}</b>\n"
-        f"Токени: {', '.join(tickers) or '—'}\n"
-        f"<i>{d.get('title', '')}</i>"
-    ))
-    # Торгуємо лише повний спот-делістинг (як і раніше).
-    if listing_type != "spot_delisting":
-        return
-    # age вище — це ЛИШЕ транспорт від їхньої відправки. Справжній вік сигналу
-    # більший на час, який їхня система витратила на сам детект (заміряно 2.28с
-    # на живому делістингу 20.08). Без цієї поправки ми (а) занижували б
-    # detect_latency у звітності, (б) не мали б воріт на застарілість, які є в
-    # поллінга — тобто після довгого реконекту зайшли б у вже відпрацьований дамп.
-    est_age = round(age + config.FEED_DETECT_LAG_SEC, 2) if age is not None else None
-    if est_age is not None and est_age > config.MAX_SIGNAL_AGE_SEC:
-        log.event("ws_stale_no_trade", tickers=tickers, est_age_sec=est_age,
-                  transport_sec=age, limit=config.MAX_SIGNAL_AGE_SEC)
-        return
-    await _fire_tickers(tickers, est_age, "ws_cryptolisting")
+async def _on_ws_feed(tickers: list, age, source: str) -> None:
+    """Сигнал із WebSocket-фіда. Веде в ТОЙ САМИЙ _fire_tickers, що й решта джерел:
+    дедуплікація живе в executor через заявку на тикер, тож повторне спрацювання
+    того ж делістингу з поллінга через десятки секунд буде відкинуте — і саме воно
+    дасть нам парний замір затримки."""
+    await _fire_tickers(tickers, age, source)
 
 
-async def _ws_loop() -> None:
-    """Основний тригер: слухає WebSocket-фід cryptolisting.ws (push, ~3-4с)."""
-    if not config.CL_WS_KEY:
-        log.info("WS: CL_WS_KEY не заданий — WebSocket-тригер вимкнено (працює лише поллінг-сторож)")
-        return
-    while True:
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.ws_connect(config.CL_WS_URL,
-                                        headers={"X-API-Key": config.CL_WS_KEY},
-                                        heartbeat=15, timeout=25) as ws:
-                    log.event("ws_connected", url=config.CL_WS_URL)
-                    async for msg in ws:
-                        if msg.type != aiohttp.WSMsgType.TEXT:
-                            if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                                break
-                            continue
-                        try:
-                            d = fastjson.loads(msg.data)
-                        except Exception:  # noqa: BLE001
-                            continue
-                        if d.get("type") == "announcement" and \
-                                d.get("listingType") in ("spot_delisting", "futures_delisting"):
-                            await _handle_ws_delisting(d)
-        except Exception:  # noqa: BLE001
-            log.exception("WS помилка зʼєднання")
-        await asyncio.sleep(5)
+def _ws_notify(text: str) -> None:
+    """Сповіщення про БУДЬ-ЯКИЙ анонс із фіда — у фон, щоб не затримувати ордер."""
+    executor.fire(tg.send_message(text))
 
 
 async def _keepalive_loop() -> None:
@@ -316,6 +304,28 @@ async def _daily_text() -> str:
                  f"нових анонсів {fc['new']}")
     lines.append(f"📊 Позицій відкрито: {storage.open_positions_count()} | "
                  f"анонсів бачено: {fc['seen']}")
+    # ЗДОРОВ'Я — у щоденне зведення (2026-10-03). Це єдина регулярна поверхня,
+    # яка реально доставлялась користувачу всі 34 доби, поки швидкий тригер був
+    # мертвий. Вона звітувала про поллінг і дні тріалу — і жодним словом про те,
+    # що tg_feed не отримав ЖОДНОГО повідомлення, а WS — жодного кадру.
+    # Тепер стан тригерів і готовність до делістингу тут є завжди.
+    lines.append("")
+    lines.append(_trigger_line())
+    s = watchdog.summary()
+    lines.append("✅ Готовий до делістингу" if s["ok"]
+                 else "❌ <b>НЕ готовий: " + ", ".join(s["failing"]) + "</b>")
+    if not s["ok"]:
+        lines.append(watchdog.report_text())
+    lines.append(preflight.report_text())
+    ts, lb = tg.stats(), log.stats()
+    if ts["failed"] or lb["errors"]:
+        lines.append("⚠️ Збоїв Telegram: " + str(ts["failed"])
+                     + " | помилок у логу: " + str(lb["errors"])
+                     + (" | остання: " + str(lb["last_error_where"])[:80]
+                        if lb["last_error_where"] else ""))
+    act = alerts.active_keys()
+    if act:
+        lines.append("🚨 Активні аварії: " + ", ".join(act))
     if left is not None and left <= 7:
         # Нагадування саме тоді, коли ще є час діяти, а не після факту.
         lines.append("\n⚠️ <b>Час вирішувати, куди переїжджати:</b>\n"
@@ -356,6 +366,8 @@ _HELP = (
     "/status — стан бота\n"
     "/positions — відкриті позиції\n"
     "/test_short СИМВОЛ — <b>РЕАЛЬНИЙ</b> тест-шорт на ${margin:g} (напр. /test_short DOGE)\n"
+    "/health — чи здатен бот відпрацювати делістинг ПРЯМО ЗАРАЗ\n"
+    "/preflight — прогнати самоперевірку бойового шляху негайно\n"
     "/daily — щоденне зведення зараз (скільки лишилось безкоштовного сервера)\n"
     "/close ID — закрити позицію за id\n"
     "/panic — 🛑 закрити ВСІ позиції\n"
@@ -381,8 +393,8 @@ async def _handle_command(text: str) -> None:
         await tg.send_message(
             "📊 <b>Стан</b>\n"
             f"Авто-режим: {mode}\n"
-            f"Тригер: {'⚡ WS' if config.CL_WS_KEY else '🐌 поллінг'}\n"
-            f"Власний детектор: {fc['polls']} опитів / {fc['errors']} збоїв, "
+            + _trigger_line() + "\n"
+            + f"Власний детектор: {fc['polls']} опитів / {fc['errors']} збоїв, "
             f"{fc['hosts']} хости, нових {fc['new']}, "
             f"торгівля {'✅' if config.FASTCMS_TRADE else '⛔'}\n"
             f"Price-cache: {pcs['symbols']} симв., WS-оновлень {pcs['ws_msgs']}\n"
@@ -395,6 +407,20 @@ async def _handle_command(text: str) -> None:
             + f"Відкритих позицій: {hs['open']} (у роботі {hs['reserved']})\n"
             f"Тест-маржа: ${config.TEST_MARGIN_USDT:g} × {config.LEVERAGE:g}x"
         )
+
+    elif cmd == "health":
+        # /status показує КОНФІГ і лічильники. Це різні питання, і плутати їх
+        # дорого: 34 доби /status чесно писав про WS, поки кадрів було нуль.
+        hc = watchdog.summary()
+        head = ("✅ <b>Готовий до делістингу</b>" if hc["ok"]
+                else "❌ <b>НЕ готовий: " + ", ".join(hc["failing"]) + "</b>")
+        await tg.send_message(head + chr(10) + watchdog.report_text()
+                              + chr(10) + chr(10) + preflight.report_text())
+
+    elif cmd == "preflight":
+        await tg.send_message("⏳ Ганяю бойовий шлях без ордера...")
+        await preflight.run_once(alert_on_fail=False)
+        await tg.send_message(preflight.report_text())
 
     elif cmd == "daily":
         await tg.send_message(await _daily_text())
@@ -515,14 +541,51 @@ def _capabilities() -> dict:
 
 
 def _fast_triggers() -> list:
-    """Швидкі тригери детекту. Поллінг сюди НЕ входить: він дає ~15с, а на
-    заміряній кривій це +5% на угоду проти +26% при вході за 1-2с."""
+    """Швидкі тригери, у яких є ДОКАЗ роботи. Поллінг сюди НЕ входить: він дає
+    медіану 46с, а на заміряній кривій це +5% на угоду проти +26% при вході за 1-2с.
+
+    ЧОМУ САМЕ ДОКАЗ, А НЕ КОНФІГ (2026-10-03). Раніше цей список будувався з
+    наявності змінних оточення. Наслідок: телеграм-фід помер 2026-08-30 і лежав
+    34 доби, а список усі ці 34 доби чесно писав "tg_feed" — бо креди ж на місці.
+    Рівно так само "ws" стояв у списку при нулі отриманих кадрів. Тобто єдиний
+    сигнал, який мав попередити про втрату швидкого детекту, сам і брехав.
+    """
+    out = []
+    if wsfeed.healthy():
+        out.append("ws")
+    if tgfeed.healthy():
+        out.append("tg_feed")
+    return out
+
+
+def _trigger_line() -> str:
+    """Один рядок про стан швидкого детекту: для /status і добового зведення.
+
+    Показує ДВА набори навмисно: що налаштовано і що реально дало дані. Саме
+    розбіжність між ними і була аварією, якої ніхто не бачив 34 доби.
+    """
+    live, conf = _fast_triggers(), _configured_triggers()
+    ws, tgs = wsfeed.stats(), tgfeed.stats()
+    if not conf:
+        return "Тригер: 🐌 лише поллінг (медіана 46с), швидкого НЕМА"
+    icon = "⚡" if live else "🐌"
+    body = (icon + " Тригер: налаштовано [" + ", ".join(conf) + "], "
+            + ("живі [" + ", ".join(live) + "]" if live else "ЖИВИХ НЕМА"))
+    body += (chr(10) + "   WS: кадрів " + str(ws["frames"]) + ", останній "
+             + (str(ws["last_frame_age_sec"]) + "с тому"
+                if ws["last_frame_age_sec"] is not None else "ніколи")
+             + ", підключень " + str(ws["connects"]))
+    body += (chr(10) + "   TG-фід: повідомлень " + str(tgs["msgs"])
+             + (", СЕСІЮ ВІДКЛИКАНО (" + str(tgs["fatal"]) + ")" if tgs["fatal"] else ""))
+    return body
+
+
+def _configured_triggers() -> list:
+    """Тригери, яким ЗАДАНО конфіг — незалежно від того, чи вони працюють.
+    Різниця з _fast_triggers() і є тією самою тихою аварією."""
     out = []
     if config.CL_WS_KEY:
         out.append("ws")
-    # tg_feed рахується з 2026-08-24: петля tgfeed.run у gather, обробник
-    # зареєстрований. cap_tg_feed каже про КРЕДИ, а цей список — про реально
-    # підключений шлях; різницю між ними ми одного разу вже проґавили на шість днів.
     if config.TG_API_ID and config.TG_API_HASH and config.TG_SESSION:
         out.append("tg_feed")
     return out
@@ -556,6 +619,34 @@ async def _supervise(factory, name: str, delay: float = 3.0,
         except Exception:  # noqa: BLE001
             log.exception(f"цикл {name} впав — перезапускаю через {delay:g}с")
             await asyncio.sleep(delay)
+
+
+async def _markets_refresh_loop() -> None:
+    """Періодично перетягує ринки бірж і перебудовує карту символів.
+
+    Делістингу підлягають і нові токени: лістинг у березні, делістинг у жовтні —
+    звичайна історія. Без оновлення такий токен для бота не існує, і подія
+    завершується рядком `skip no_perp` у лозі, якого ніхто не читає. Робимо це
+    рідко (раз на MARKETS_REFRESH_SEC), у потоці, і НІКОЛИ поки є сигнал у роботі:
+    load_markets тримає GIL на тисячах ринків, а гарячий шлях цього не пробачає.
+    """
+    if config.MARKETS_REFRESH_SEC <= 0:
+        log.info("оновлення ринків вимкнено (MARKETS_REFRESH_SEC=0)")
+        return
+    while True:
+        await asyncio.sleep(config.MARKETS_REFRESH_SEC)
+        while executor.busy():
+            await asyncio.sleep(0.5)
+        try:
+            st = await asyncio.to_thread(exchange.reload_markets)
+            log.event("markets_refreshed", **st)
+            if st.get("added"):
+                # Нові перпи треба ще й озброїти плечем, інакше перший ордер по
+                # такому символу заплатить зайвий мережевий виклик у найгірший
+                # момент. Фоновий арм підхопить їх на наступному колі сам.
+                log.event("markets_new_symbols", added=st["added"])
+        except Exception:  # noqa: BLE001
+            log.exception("оновлення ринків впало")
 
 
 async def _reconcile_loop() -> None:
@@ -605,6 +696,8 @@ async def main() -> None:
     # інакше сторож на першому ж проході вважав би всі 20 наявних статей новими.
     fastcms.set_handler(_on_fastcms)
     tgfeed.set_handler(_on_tg_feed)
+    wsfeed.set_handler(_on_ws_feed)
+    wsfeed.set_notifier(_ws_notify)
     log.event("fastcms_primed", seen=fastcms.prime())
     gcinfo = runtime.tune_gc()
     log.event("runtime", loop=_LOOP, json=fastjson.NAME, **gcinfo)
@@ -617,16 +710,28 @@ async def main() -> None:
               daily_pnl=round(executor.daily_pnl(), 4),
               open_positions=storage.open_positions_count(),
               fast_triggers=_fast_triggers(),
+              configured_triggers=_configured_triggers(),
               tg_auth_ok=await tg.verify(), **_capabilities())
-    if not _fast_triggers():
+    # На СТАРТІ живість ще не доведена нічим (кадр не прийшов, повідомлення не
+    # прийшло) — тому тут питаємо про КОНФІГ. Живість візьме на себе watchdog,
+    # який дасть першу оцінку через WATCHDOG_GRACE_SEC і буде кричати, поки не
+    # полагодять. Якби тут стояв _fast_triggers(), кожен рестарт слав би фальшиву
+    # тривогу, а фальшива тривога швидко вчить ігнорувати справжню.
+    if not _configured_triggers():
         log.event("degraded_detection", fast_triggers=[],
                   falls_back_to="fastcms_polling",
-                  measured_cost="детект ~15с замість ~4с: +5% замість +26% на угоду")
-        log.error("УВАГА: швидкого тригера НЕМА — лише поллінг (~15с). "
+                  measured_cost="детект медіана 46с замість ~4.5с: "
+                                "+5% замість +26% на угоду")
+        log.error("УВАГА: швидкого тригера НЕМА — лише поллінг (медіана 46с). "
                   "Перевір CL_WS_KEY або TG_API_ID+TG_API_HASH+TG_SESSION.")
     if config.TELEGRAM_CHAT_ID:
         mode = "🧪 DRY-RUN (без реальних ордерів)" if config.DRY_RUN else "⚠️ РЕАЛЬНА ТОРГІВЛЯ"
-        trigger = "⚡ WebSocket (швидкий)" if config.CL_WS_KEY else "🐌 лише поллінг"
+        conf = _configured_triggers()
+        # Свідомо кажемо «налаштовано», а не «працює»: на старті доказу роботи ще
+        # нема. Рівно це формулювання 34 доби вводило в оману — писало «⚡ WS»,
+        # хоча кадрів було нуль.
+        trigger = ("⚡ налаштовано: " + ", ".join(conf) + " (живість перевірить сторож)"
+                   if conf else "🐌 лише поллінг — швидкого тригера НЕМА")
         open_n = storage.open_positions_count()
         await tg.send_message(
             "🟢 <b>Delisting-бот запущено</b>\n"
@@ -656,7 +761,7 @@ async def main() -> None:
     await asyncio.gather(
         _supervise(fastcms.run, "fastcms"),
         _supervise(tgfeed.run, "tg_feed", optional=True),
-        _supervise(_ws_loop, "ws", optional=True),
+        _supervise(wsfeed.run, "ws", optional=True),
         _supervise(_watch_loop, "watch"),
         _supervise(_monitor_loop, "monitor"),
         _supervise(_keepalive_loop, "keepalive"),
@@ -667,6 +772,12 @@ async def main() -> None:
         _supervise(_reconcile_loop, "reconcile"),
         _supervise(_daily_report_loop, "daily_report"),
         _supervise(runtime.loop_lag_monitor, "loop_lag"),
+        # Сторож живості і самоперевірка бойового шляху. Делістинг буває раз на
+        # 3-6 тижнів, тому між подіями ніщо інше не виконує гарячий шлях і не
+        # перевіряє, чи ми взагалі здатні відпрацювати. Див. watchdog.py/preflight.py.
+        _supervise(watchdog.run, "watchdog"),
+        _supervise(preflight.run, "preflight", optional=True),
+        _supervise(_markets_refresh_loop, "markets_refresh", optional=True),
         # Реальні позиції могли лишитись від попереднього запуску. Раніше це
         # чекали ПЕРЕД gather — а якщо Bybit гальмує (часта причина рестарту),
         # бот стояв глухий десятки секунд, не чуючи анонсів.
