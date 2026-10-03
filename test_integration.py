@@ -7,6 +7,13 @@
 Реальних ордерів НЕ ставить (real=False скрізь).
 Запуск на сервері:  ~/delisting-bot/.venv/bin/python test_integration.py
 """
+
+# Тести НІКОЛИ не пишуть у бойовий events.jsonl: 2026-10-03 прогін на сервері
+# залишив там 15 синтетичних подій ws_frame, тобто отруїв саме той файл, за
+# яким ми судимо, чи фід віддав хоч один справжній кадр. Має стояти ДО будь-якого
+# імпорту модулів бота, бо logbook читає цю змінну на імпорті.
+import os
+os.environ.setdefault("BOT_LOG_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs-test"))
 import asyncio
 import os
 import sys

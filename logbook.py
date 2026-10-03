@@ -15,14 +15,21 @@ arm_exchange_stop, надсилання в Telegram), і `main._supervise` це 
 import datetime as dt
 import json
 import logging
+import os
 import sys
 import traceback
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 _BASE = Path(__file__).parent
-_LOGDIR = _BASE / "logs"
-_LOGDIR.mkdir(exist_ok=True)
+# BOT_LOG_DIR дає тестам власну теку логів. Причина конкретна: 2026-10-03
+# test_wsfeed.py, запущений на БОЙОВІЙ машині, записав 15 синтетичних подій
+# ws_frame прямо в events.jsonl. А саме цей файл відповідає на питання «чи фід
+# коли-небудь віддав хоч один кадр» — тобто тест отруїв єдине джерело правди
+# про те, що він перевіряє. Події мають бути або з бою, або з тесту, і ніколи
+# в одному файлі.
+_LOGDIR = Path(os.environ.get("BOT_LOG_DIR") or (_BASE / "logs"))
+_LOGDIR.mkdir(parents=True, exist_ok=True)
 _EVENTS = _LOGDIR / "events.jsonl"
 NEWLINE = chr(10)
 
