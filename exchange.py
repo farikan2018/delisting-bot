@@ -84,7 +84,8 @@ def warm_ping(venue: str) -> dict:
     fetch_time: той самий пул і той самі TLS, але без підпису — отже без
     одночасних nonce на бойовому клієнті.
     """
-    res = {"public_ok": False, "signed_ok": False, "free": None, "warmed": 0}
+    res = {"public_ok": False, "signed_ok": False, "free": None, "warmed": 0,
+           "has_key": False}
     try:
         c = client(venue)
         if c.has.get("fetchTime"):
@@ -97,7 +98,11 @@ def warm_ping(venue: str) -> dict:
 
     key, _sec = _KEYS.get(venue, lambda: ("", ""))()
     if not key:
+        # Ключа нема взагалі — це не збій, а конфігурація. Розрізняти обовʼязково:
+        # інакше сторож рахував би відсутність ключа на MEXC/Gate як мертвий ключ
+        # і слав би тривоги про те, що й так відомо, привчаючи їх ігнорувати.
         return res
+    res["has_key"] = True
     tc = trade_client(venue)
     n = max(1, int(config.MAX_CONCURRENT))
     if n > 1 and tc.has.get("fetchTime"):

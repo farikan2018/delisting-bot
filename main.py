@@ -210,7 +210,8 @@ async def _keepalive_loop() -> None:
     for v in config.VENUE_PRIORITY:
         r = await asyncio.to_thread(exchange.warm_ping, v)
         warmed.append(v + ":" + ("ok" if r.get("public_ok") else "fail")
-                      + "/sig:" + ("ok" if r.get("signed_ok") else "fail"))
+                      + "/sig:" + ("ok" if r.get("signed_ok") else
+                                   "fail" if r.get("has_key") else "нема ключа"))
     log.event("keepalive_start", venues=warmed, interval_sec=config.KEEPALIVE_SEC)
     # Підписаний виклик — єдине, що справді доводить живий ключ. Рахуємо невдачі
     # поспіль: раніше результат warm_ping у циклі ВІДКИДАВСЯ зовсім, тож мертвий
@@ -221,8 +222,8 @@ async def _keepalive_loop() -> None:
         for v in config.VENUE_PRIORITY:
             try:
                 r = await asyncio.to_thread(exchange.warm_ping, v)
-                if not config.BYBIT_API_KEY and v == "bybit":
-                    pass
+                if not r.get("has_key"):
+                    pass        # біржа без ключів — тут нема чого ламатись
                 elif r.get("signed_ok"):
                     if sig_fail[v] >= 3:
                         await alerts.clear_alert("Ключ " + v + " не працює")
