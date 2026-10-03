@@ -126,7 +126,11 @@ async def main():
     px = OPEN_EV["entry_price"]
     pricecache.get_price = lambda raw: (px, 0.2)
     pricecache.reference_high = lambda raw, mins: px * 1.01
+    # Скидання стану МІЖ ФАЗАМИ тесту, а не імітація продакшену: forget() більше
+    # не знімає заявку (щоб один анонс не давав двох входів із різних джерел),
+    # тож тут знімаємо її явно — інакше друга фаза відсіклась би як дубль.
     executor.forget(TICKER, meta["symbol"])
+    executor._claimed.pop(TICKER, None)
     storage.close_position(storage.get_open_positions()[0]["id"], px, "MANUAL", 0.0, 0.0)
     executor.resync_open()
     OPEN_EV.clear()
@@ -180,9 +184,17 @@ async def main():
     check("PnL записано (dry не годує вимикач)", executor.daily_pnl() == 0.0,
           f"daily={executor.daily_pnl()}")
 
-    print("\n=== 7) тикер знову доступний після закриття ===")
-    check("заявку знято", TICKER not in executor._claimed)
+    print("\n=== 7) після закриття: символ вільний, але подія вже відпрацьована ===")
     check("символ знято з памʼяті", fresh["symbol"] not in executor._open_symbols)
+    # Змінено 2026-10-03. Раніше тут перевірялось «заявку знято». Але джерел
+    # детекту тепер кілька і вони незалежні: резервний фід дає сигнал ~18с,
+    # власний поллінг ~46с. Якщо перша позиція встигла взяти тейк між ними,
+    # знята заявка дозволяла ДРУГИЙ вхід на тій самій події — по дну вже
+    # відпрацьованого дампа. Заявка тепер доживає CLAIM_TTL_SEC від відкриття.
+    check("заявка лишилась — другий вхід на ТІЙ САМІЙ події неможливий",
+          TICKER in executor._claimed)
+    why = executor._reserve(TICKER, fresh["symbol"], 0.0)
+    check("повторний сигнал відсікається як дубль", why == "duplicate_source", why)
 
     print("\n" + ("ІНТЕГРАЦІЯ OK" if not FAILS else f"ПРОВАЛЕНО: {FAILS}"))
 
