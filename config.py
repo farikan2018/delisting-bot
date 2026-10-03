@@ -78,6 +78,21 @@ WS_IDLE_ALERT_SEC = float(_ENV.get("WS_IDLE_ALERT_SEC", "600") or "600")
 # постфактум означає пропустити делістинг.
 WS_KEY_WARN_SEC = float(_ENV.get("WS_KEY_WARN_SEC", str(48 * 3600))
                         or str(48 * 3600))
+
+# --- Резервне джерело детекту: публічний JSON постачальника (без ключа) ---
+# Постачальник сам називає його «fallback source when the WebSocket is
+# unreachable» і просить не частіше ніж раз на 30с (підлога зашита в clwjson.py).
+# Звірено на всій їхній історії: binance+spot_delisting = рівно повні анонси
+# «Binance Will Delist X, Y, Z», один до одного, без margin і без прибирання пар.
+# Заміряно: їхній детект +2.28с (медіана, n=7), публікація файлу +0.51с.
+CLW_JSON = (_ENV.get("CLW_JSON", "1").strip() != "0")
+CLW_JSON_URL = _ENV.get(
+    "CLW_JSON_URL", "https://cryptolisting.ws/data/recent-announcements.json").strip()
+CLW_JSON_POLL_SEC = float(_ENV.get("CLW_JSON_POLL_SEC", "30") or "30")
+# Торгувати з цього джерела. Безпека не на довірі, а на арифметиці: вік сигналу
+# рахується від ЇХНЬОГО detected_at_us, тож завислий файл не пройде ворота
+# MAX_SIGNAL_AGE_SEC і просто нічого не відкриє.
+CLW_JSON_TRADE = (_ENV.get("CLW_JSON_TRADE", "1").strip() != "0")
 # Самоперевірка бойового шляху (preflight.py): прогін усіх кроків відкриття
 # позиції БЕЗ ордера. Раз на стільки секунд; 0 = лише на старті.
 PREFLIGHT_SEC = float(_ENV.get("PREFLIGHT_SEC", str(6 * 3600)) or str(6 * 3600))

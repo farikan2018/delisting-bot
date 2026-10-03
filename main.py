@@ -20,6 +20,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 import alerts
 import binance_watcher as bw
+import clwjson
 import config
 import dumpwatch
 import exchange
@@ -552,6 +553,8 @@ def _capabilities() -> dict:
         "cap_fastcms": config.FASTCMS,
         "cap_fastcms_trade": config.FASTCMS_TRADE,
         "cap_ws": bool(config.CL_WS_KEY),
+        "cap_clw_json": config.CLW_JSON,
+        "cap_clw_json_trade": config.CLW_JSON and config.CLW_JSON_TRADE,
         "cap_tg_feed": bool(config.TG_API_ID and config.TG_API_HASH
                             and config.TG_SESSION),
         "cap_tg_notify": bool(config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID),
@@ -589,18 +592,26 @@ def _trigger_line() -> str:
     розбіжність між ними і була аварією, якої ніхто не бачив 34 доби.
     """
     live, conf = _fast_triggers(), _configured_triggers()
-    ws, tgs = wsfeed.stats(), tgfeed.stats()
-    if not conf:
-        return "Тригер: 🐌 лише поллінг (медіана 46с), швидкого НЕМА"
+    ws, tgs, cj = wsfeed.stats(), tgfeed.stats(), clwjson.stats()
     icon = "⚡" if live else "🐌"
-    body = (icon + " Тригер: налаштовано [" + ", ".join(conf) + "], "
-            + ("живі [" + ", ".join(live) + "]" if live else "ЖИВИХ НЕМА"))
-    body += (chr(10) + "   WS: кадрів " + str(ws["frames"]) + ", останній "
+    if conf:
+        body = (icon + " Тригер: налаштовано [" + ", ".join(conf) + "], "
+                + ("живі [" + ", ".join(live) + "]" if live else "ЖИВИХ НЕМА"))
+    else:
+        body = "🐌 Тригер: швидкого НЕМА взагалі (ні ключа WS, ні сесії Telegram)"
+    body += (chr(10) + "   WS: кадрів " + str(ws["frames"])
+             + ", heartbeat " + str(ws["heartbeats"]) + ", останній "
              + (str(ws["last_frame_age_sec"]) + "с тому"
-                if ws["last_frame_age_sec"] is not None else "ніколи")
+                if ws["last_frame_age_sec"] is not None else "ЖОДНОГО")
              + ", підключень " + str(ws["connects"]))
     body += (chr(10) + "   TG-фід: повідомлень " + str(tgs["msgs"])
              + (", СЕСІЮ ВІДКЛИКАНО (" + str(tgs["fatal"]) + ")" if tgs["fatal"] else ""))
+    # Резерв показуємо ЗАВЖДИ, і найважливіше — саме коли швидких тригерів нема:
+    # у цьому стані він єдиний тримає детект у межах воріт застарілості.
+    body += (chr(10) + "   Резерв (публічний JSON, ~18с): "
+             + ("✅ читається" if clwjson.healthy() else "❌ не читається")
+             + ", сигналів " + str(cj["signals"]))
+    body += chr(10) + "   Власний поллінг: медіана 46с, стеля 96с"
     return body
 
 
@@ -722,6 +733,8 @@ async def main() -> None:
     tgfeed.set_handler(_on_tg_feed)
     wsfeed.set_handler(_on_ws_feed)
     wsfeed.set_notifier(_ws_notify)
+    clwjson.set_handler(_on_ws_feed)
+    clwjson.set_notifier(_ws_notify)
     log.event("fastcms_primed", seen=fastcms.prime())
     gcinfo = runtime.tune_gc()
     log.event("runtime", loop=_LOOP, json=fastjson.NAME, **gcinfo)
@@ -786,6 +799,10 @@ async def main() -> None:
         _supervise(fastcms.run, "fastcms"),
         _supervise(tgfeed.run, "tg_feed", optional=True),
         _supervise(wsfeed.run, "ws", optional=True),
+        # Резервне джерело без ключа. Повільніше за WS (медіана ~18с проти ~4с),
+        # але швидше і стабільніше за власний поллінг (46с, максимум 96с), і
+        # не залежить ні від ключа постачальника, ні від індексу Binance.
+        _supervise(clwjson.run, "clw_json", optional=True),
         _supervise(_watch_loop, "watch"),
         _supervise(_monitor_loop, "monitor"),
         _supervise(_keepalive_loop, "keepalive"),

@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 
 import alerts
+import clwjson
 import config
 import exchange
 import fastcms
@@ -95,6 +96,25 @@ def _check_fast_trigger() -> dict:
                "ЖОДНОГО швидкого тригера. " + "; ".join(why)
                + ". Детект впаде на поллінг (медіана 46с): ~+5% на угоду замість ~+26%.",
                critical=True)
+
+
+def _check_backup_feed() -> dict:
+    """Резервне джерело детекту (публічний JSON постачальника, без ключа).
+
+    Це НЕ швидкий тригер: заміряна медіана ~18с проти ~4с у WebSocket. Але воно
+    втричі кращe за власний поллінг (46с) і обмежує найгірший випадок 33 секундами
+    замість 96. Коли швидких тригерів нема взагалі — а саме так зараз — це єдине,
+    що взагалі тримає детект у межах воріт застарілості.
+    """
+    if not config.CLW_JSON:
+        return _ok("backup_feed", None, "вимкнено конфігом")
+    s = clwjson.stats()
+    ok = clwjson.healthy()
+    return _ok("backup_feed", ok,
+               "читань " + str(s["polls"]) + " (+" + str(s["not_modified"])
+               + " без змін), останнє " + _ago(s["last_ok_age_sec"])
+               + ", сигналів " + str(s["signals"])
+               + ("" if ok else " — резервне джерело НЕ читається"))
 
 
 def _check_fastcms() -> list[dict]:
@@ -197,6 +217,7 @@ def health() -> list[dict]:
     """Усі перевірки одним знімком. Чисто з пам'яті, без мережі."""
     checks = [_check_fast_trigger()]
     checks += _check_fastcms()
+    checks.append(_check_backup_feed())
     checks.append(_check_announcement_flow())
     checks += _check_money()
     checks += _check_plumbing()
