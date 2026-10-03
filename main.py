@@ -511,8 +511,13 @@ async def _handle_command(text: str) -> None:
             ok, bad = 0, []
             for p in rows:
                 try:
-                    await executor.force_close(p["id"], reason="MANUAL")
-                    ok += 1
+                    # Рахуємо РЕЗУЛЬТАТ, а не факт виклику. Раніше лічильник
+                    # збільшувався завжди, коли не було винятку, — тож /panic міг
+                    # написати «Закрито 3 з 3», поки на біржі висіли всі три.
+                    if await executor.force_close(p["id"], reason="MANUAL"):
+                        ok += 1
+                    else:
+                        bad.append(f"#{p['id']} {p['ticker']}")
                 except Exception:  # noqa: BLE001
                     log.exception(f"panic: не закрилась #{p['id']}")
                     bad.append(f"#{p['id']} {p['ticker']}")

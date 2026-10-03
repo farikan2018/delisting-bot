@@ -491,6 +491,7 @@ async def _fill_details(venue: str, symbol: str, order: dict) -> tuple:
     часто повертає порожньо. Живий тест це й показав: закриття записалось із
     `fees: 0.0`, хоча комісія була — тобто PnL систематично завищувався б на
     ~0.4% маржі за угоду, і цим завищеним числом живився б аварійний вимикач."""
+    order = order or {}   # порожня відповідь — не привід падати ПІСЛЯ ордера
     avg = order.get("average") or order.get("price")
     fee = (order.get("fee") or {}).get("cost")
     oid = order.get("id")
@@ -705,7 +706,18 @@ async def force_close(pos_id: int, reason: str = "MANUAL") -> bool:
         if pos["id"] == pos_id:
             price = await current_price(pos) or pos["entry_price"]
             await _do_close(pos, price, reason)
-            return True
+            # ПЕРЕВІРЯЄМО, а не припускаємо (2026-10-03). Раніше тут стояло
+            # «return True» одразу після виклику — тобто функція звітувала про
+            # успіх, навіть коли _do_close не закрив нічого: біржа відхилила
+            # ордер, замок був зайнятий іншою задачею, позиція лишилась жива.
+            # Наслідок конкретний: /panic писав «Закрито 3 з 3», а на біржі
+            # висіли позиції на реальні гроші. Саме в аварійній команді брехати
+            # про результат найдорожче.
+            still_open = any(p["id"] == pos_id for p in storage.get_open_positions())
+            if still_open:
+                log.event("force_close_failed", pos_id=pos_id, reason=reason,
+                          symbol=pos["symbol"])
+            return not still_open
     return False
 
 

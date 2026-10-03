@@ -403,5 +403,37 @@ check("реальна ціна виконання повертається", got
 check("комісія входу збережена в БД",
       storage.meta_get(f"entry_fee:{pos4['id']}") is not None)
 
+# ---------- 14) /panic не має брехати про результат ----------
+print("\n14) force_close звітує РЕЗУЛЬТАТ, а не факт виклику")
+# Аварійна команда — єдине, чим користувач рятує реальні гроші, коли бот уже
+# помилився. Раніше вона повертала True одразу після виклику _do_close, тож
+# «Закрито 3 з 3» могло означати три живі позиції на біржі.
+ids5 = []
+pos5 = _mk_pos(ids5)
+_prev_close = exchange.close_short
+_prev_size = exchange.position_size
+
+
+def _reject(*a, **k):
+    raise RuntimeError("exchange rejected close")
+
+
+exchange.close_short = _reject        # біржа відхиляє закриття
+exchange.position_size = lambda v, s: 5.0   # позиція ЖИВА, тобто не "вже flat"
+executor._close_alerted.discard(pos5["id"])
+got = asyncio.run(executor.force_close(pos5["id"]))
+check("невдале закриття -> False", got is False, str(got))
+check("запис лишився відкритим", any(p["id"] == pos5["id"]
+                                     for p in storage.get_open_positions()))
+
+exchange.close_short = lambda *a, **k: {"id": "ORD-PANIC", "average": 1.0,
+                                        "fee": {"cost": 0.0}}  # біржа приймає
+got = asyncio.run(executor.force_close(pos5["id"]))
+check("вдале закриття -> True", got is True, str(got))
+check("запис закрито", not any(p["id"] == pos5["id"]
+                               for p in storage.get_open_positions()))
+check("неіснуючий id -> False", asyncio.run(executor.force_close(999999)) is False)
+exchange.position_size = _prev_size
+
 print("\n" + ("ВСІ ТЕСТИ ПРОЙШЛИ" if not FAILS else f"ПРОВАЛЕНО: {FAILS}"))
 sys.exit(1 if FAILS else 0)
