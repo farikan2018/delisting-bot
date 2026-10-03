@@ -368,6 +368,7 @@ _HELP = (
     "/test_short СИМВОЛ — <b>РЕАЛЬНИЙ</b> тест-шорт на ${margin:g} (напр. /test_short DOGE)\n"
     "/health — чи здатен бот відпрацювати делістинг ПРЯМО ЗАРАЗ\n"
     "/preflight — прогнати самоперевірку бойового шляху негайно\n"
+    "/wstest — довести, що WS-фід живий (синтетичний анонс)\n"
     "/daily — щоденне зведення зараз (скільки лишилось безкоштовного сервера)\n"
     "/close ID — закрити позицію за id\n"
     "/panic — 🛑 закрити ВСІ позиції\n"
@@ -421,6 +422,29 @@ async def _handle_command(text: str) -> None:
         await tg.send_message("⏳ Ганяю бойовий шлях без ордера...")
         await preflight.run_once(alert_on_fail=False)
         await tg.send_message(preflight.report_text())
+
+    elif cmd == "wstest":
+        # Постачальник приймає {"type":"test"} і відповідає синтетичним анонсом.
+        # Це ЄДИНИЙ спосіб довести, що шлях «сокет → парсер → обробник» живий,
+        # не чекаючи делістингу (а вони раз на 3-6 тижнів). Саме відсутність
+        # такої перевірки дала 34 доби мертвого тригера під виглядом робочого.
+        await tg.send_message("⏳ Прошу у фіда синтетичний анонс…")
+        res = await wsfeed.selftest("telegram", wait_sec=12.0)
+        s = wsfeed.stats()
+        if res.get("ok"):
+            await tg.send_message(
+                "✅ <b>WS живий</b> — синтетичний анонс дійшов за "
+                + str(res.get("took_sec")) + "с." + chr(10)
+                + "Кадрів усього " + str(s["frames"]) + ", heartbeat "
+                + str(s["heartbeats"]) + ", тариф " + str(s["tier"]))
+        else:
+            await tg.send_message(
+                "❌ <b>WS НЕ віддає дані</b>: " + str(res.get("why")) + chr(10)
+                + "Кадрів за весь час: " + str(s["frames"])
+                + ", heartbeat: " + str(s["heartbeats"])
+                + ", підключень: " + str(s["connects"]) + chr(10)
+                + "<i>Документований heartbeat — кожні 30с, тож нуль кадрів "
+                + "означає мертвий ключ або ліміт IP, а не затишшя.</i>")
 
     elif cmd == "daily":
         await tg.send_message(await _daily_text())
