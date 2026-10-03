@@ -65,7 +65,7 @@ _CLOSE_MEANING = {
 }
 
 _stats = {
-    "frames": 0, "non_text": 0, "acks": 0, "parse_fails": 0,
+    "frames": 0, "non_text": 0, "binary_frames": 0, "acks": 0, "parse_fails": 0,
     "welcomes": 0, "heartbeats": 0, "announcements": 0, "delist_frames": 0,
     "signals": 0, "skipped_stale": 0, "skipped_category": 0, "skipped_publisher": 0,
     "schema_drift": 0, "errors_from_server": 0,
@@ -250,9 +250,11 @@ async def _on_welcome(p: dict, d_raw: str) -> None:
             cooldown_sec=12 * 3600)
 
 
-async def _on_frame(raw: str) -> None:
+async def _on_frame(raw: str, binary: bool = False) -> None:
     now_ms = int(time.time() * 1000)
     _stats["frames"] += 1
+    if binary:
+        _stats["binary_frames"] += 1
     _stats["last_frame_ms"] = now_ms
     n = _stats["frames"]
     p = parse(raw)
@@ -267,7 +269,8 @@ async def _on_frame(raw: str) -> None:
     # хоча насправді це був maxDistinctIps=1 і друге з'єднання з іншої машини.
     if n <= _FULL_FRAMES:
         log.event("ws_frame", n=n, raw=raw[:_RAW_CLIP], keys=p["keys"],
-                  type=p["type"], listing_type=p["listing_type"])
+                  type=p["type"], listing_type=p["listing_type"],
+                  binary=binary)
     elif p["type"] == "heartbeat":
         pass          # кожні 30с: у лог не пишемо, лише лічильник і мітка часу
     elif n <= _COMPACT_AFTER or n % _SAMPLE_EVERY == 0:
@@ -443,9 +446,20 @@ async def run() -> None:
                     # Доказ життя одразу після підключення, не чекаючи делістингу.
                     asyncio.ensure_future(_selftest_after_connect())
                     async for msg in ws:
-                        if msg.type is aiohttp.WSMsgType.TEXT:
+                        # BINARY нарівні з TEXT (2026-10-03). Саме це й ховало
+                        # фід 34 доби: код читав ТІЛЬКИ TEXT, а лічильник
+                        # non_text показав 482 відкинуті кадри за 4 години —
+                        # рівно один на 30с, тобто документований heartbeat.
+                        # Транспортний кадр — це спосіб доставки, а не формат
+                        # даних; розбирати треба вміст, а не тип кадру.
+                        if msg.type in (aiohttp.WSMsgType.TEXT,
+                                        aiohttp.WSMsgType.BINARY):
                             try:
-                                await _on_frame(msg.data)
+                                data = msg.data
+                                if isinstance(data, (bytes, bytearray)):
+                                    data = bytes(data).decode("utf-8", "replace")
+                                await _on_frame(data, binary=msg.type is
+                                                aiohttp.WSMsgType.BINARY)
                             except Exception:  # noqa: BLE001
                                 # Виняток на одному кадрі не має вбивати підписку:
                                 # наступний анонс важливіший за цей.
