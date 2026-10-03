@@ -252,8 +252,16 @@ async def run() -> None:
         _last_new_ms = int(storage.meta_get(_META_LAST_NEW) or 0)
     except Exception:  # noqa: BLE001
         _last_new_ms = 0
+    # Перший знімок — швидко, решта за розкладом. Інакше після кожного рестарту
+    # у лозі пʼять хвилин немає жодної відповіді на питання «а бот узагалі
+    # здатен відпрацювати?», і саме в цьому вікні найімовірніше видно наслідки
+    # щойно зміненого конфігу. Тривоги при цьому все одно притримує
+    # WATCHDOG_GRACE_SEC: кеші на старті ще порожні.
+    first = True
     while True:
-        await asyncio.sleep(config.WATCHDOG_SEC)
+        await asyncio.sleep(min(45.0, config.WATCHDOG_SEC) if first
+                            else config.WATCHDOG_SEC)
+        first = False
         try:
             checks = health()
             _stats["rounds"] += 1
