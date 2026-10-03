@@ -86,9 +86,12 @@ check("ті самі тикери з різних бірж не злипають
 
 print()
 print("=== 2) Торгуємо РІВНО binance + spot_delisting ===")
-fire([ev("binance", "ICX", "spot_delisting", now_us(-3)),
-      ev("binance", "SCRT", "spot_delisting", now_us(-3)),
-      ev("binance", "STORJ", "spot_delisting", now_us(-3))])
+# Усі тикери одного анонсу приходять окремими рядками з однією міткою детекту —
+# саме так, як у живому файлі (HOOK і D обидва на 1790926200429435).
+_t = now_us(-3)
+fire([ev("binance", "ICX", "spot_delisting", _t),
+      ev("binance", "SCRT", "spot_delisting", _t),
+      ev("binance", "STORJ", "spot_delisting", _t)])
 check("один сигнал на весь анонс", len(SIGNALS) == 1, len(SIGNALS))
 check("усі три тикери в ньому",
       SIGNALS and sorted(SIGNALS[0]["tickers"]) == ["ICX", "SCRT", "STORJ"],
@@ -131,7 +134,7 @@ check("подія в межах порога торгується", len(SIGNALS)
 
 print()
 print("=== 5) Різні анонси в одному зчитуванні не змішуються ===")
-t1, t2 = now_us(-4), now_us(-6)
+t1, t2 = now_us(-4), now_us(-9)
 fire([ev("binance", "AAA", "spot_delisting", t1),
       ev("binance", "BBB", "spot_delisting", t1),
       ev("binance", "CCC", "spot_delisting", t2)])
@@ -139,6 +142,37 @@ check("два окремі сигнали", len(SIGNALS) == 2, len(SIGNALS))
 groups = sorted(tuple(sorted(s["tickers"])) for s in SIGNALS)
 check("групування за моментом детекту правильне",
       groups == [("AAA", "BBB"), ("CCC",)], groups)
+
+# Крихкість, на якій тест уже спіймав помилку: на сервері три послідовні виклики
+# годинника дали три РІЗНІ мікросекунди, і анонс розпався на три сигнали. У бою
+# це означало б, що третій токен заходить на два ордерні раунди пізніше.
+base = now_us(-5)
+fire([ev("binance", "AAA", "spot_delisting", base),
+      ev("binance", "BBB", "spot_delisting", base + 137),
+      ev("binance", "CCC", "spot_delisting", base + 4021)])
+check("мікросекундний розкид НЕ розриває анонс", len(SIGNALS) == 1, len(SIGNALS))
+check("усі тикери разом",
+      SIGNALS and sorted(SIGNALS[0]["tickers"]) == ["AAA", "BBB", "CCC"],
+      SIGNALS[0]["tickers"] if SIGNALS else None)
+
+fire([ev("binance", "AAA", "spot_delisting", base),
+      ev("binance", "AAA", "spot_delisting", base)])
+check("дубль тикера в одному анонсі не подвоюється",
+      SIGNALS and SIGNALS[0]["tickers"] == ["AAA"],
+      SIGNALS[0]["tickers"] if SIGNALS else None)
+
+# Межа секунди: фіксоване відро (us // 1e6) розірвало б цю пару, кластеризація
+# за близькістю — ні. Саме цей крайовий випадок і був причиною відмови від відер.
+edge = (int(time.time()) - 5) * 1_000_000 + 999_900
+fire([ev("binance", "AAA", "spot_delisting", edge),
+      ev("binance", "BBB", "spot_delisting", edge + 300)])
+check("пара на межі секунди лишається одним анонсом", len(SIGNALS) == 1, len(SIGNALS))
+
+# А ось справді далекі події мають лишитись окремими.
+far = now_us(-20)
+fire([ev("binance", "AAA", "spot_delisting", far),
+      ev("binance", "BBB", "spot_delisting", far + 3_000_000)])
+check("події з розривом 3с — два різні анонси", len(SIGNALS) == 2, len(SIGNALS))
 
 print()
 print("=== 6) Сміття не валить цикл ===")

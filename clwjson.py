@@ -53,6 +53,11 @@ _notifier = None
 # безкоштовний сервіс. Значення з .env не може опуститись нижче.
 _MIN_PERIOD_SEC = 30.0
 _MAX_SEEN = 4000
+# Наскільки близькі мітки детекту вважати одним анонсом. Два РІЗНІ спот-делістинги
+# Binance у межах секунди неможливі: за їхньою ж історією вони трапляються раз на
+# ~19 діб. Зате розрив одного анонсу на кілька сигналів цілком реальний — і
+# коштує двох ордерних раундів затримки для останнього токена.
+_GROUP_WINDOW_US = 1_000_000
 
 _seen: set = set()
 _stats = {"polls": 0, "not_modified": 0, "errors": 0, "events_new": 0,
@@ -114,7 +119,15 @@ async def _handle_new(events: list) -> None:
     """Нові події одного зчитування. Події одного анонсу приходять окремими
     рядками з ОДНАКОВИМ detected_at_us — групуємо, щоб усі тикери анонсу пішли
     в один сигнал і відкривались паралельно, а не по черзі."""
-    groups: dict = {}
+    # Групуємо за моментом детекту, ЗАОКРУГЛЕНИМ до секунди. У живих даних усі
+    # тикери одного анонсу мають однаковий detected_at_us до мікросекунди
+    # (перевірено: HOOK і D — обидва 1790926200429435), але покладатись на точну
+    # рівність крихко. Ціна помилки конкретна: розгрупований анонс пішов би
+    # кількома послідовними викликами, і третій токен заходив би на два ордерні
+    # раунди пізніше — тобто ми б самі відтворили затримку, заради усунення якої
+    # і робився паралельний _fire_tickers. Два РІЗНІ спот-делістинги в межах
+    # однієї секунди неможливі: вони трапляються раз на ~19 діб.
+    hits = []
     for e in events:
         if str(e.get("cex", "")).lower() != "binance":
             continue
@@ -122,11 +135,24 @@ async def _handle_new(events: list) -> None:
             continue
         tk = str(e.get("ticker") or "").strip().upper()
         us = e.get("detected_at_us")
-        if not tk or not isinstance(us, (int, float)):
+        if not tk or not isinstance(us, (int, float)) or isinstance(us, bool):
             continue
-        groups.setdefault(int(us), []).append(tk)
+        hits.append((int(us), tk))
 
-    for us, tickers in sorted(groups.items()):
+    # Кластеризація за БЛИЗЬКІСТЮ, не за фіксованим відром: відро ділить події на
+    # межі секунди, а це рівно той крихкий випадок, якого ми й позбуваємось.
+    groups = []
+    for us, tk in sorted(hits):
+        if groups and us - groups[-1]["us"] <= _GROUP_WINDOW_US:
+            g = groups[-1]
+        else:
+            g = {"us": us, "tickers": []}
+            groups.append(g)
+        if tk not in g["tickers"]:
+            g["tickers"].append(tk)
+
+    for g in groups:
+        us, tickers = g["us"], g["tickers"]
         _stats["delist_groups"] += 1
         since_detect = round(time.time() - us / 1e6, 2)
         est_age = round(since_detect + config.FEED_DETECT_LAG_SEC, 2)
